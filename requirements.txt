@@ -1,0 +1,8 @@
+streamlit>=1.50
+pandas>=2.1
+numpy
+plotly
+requests
+akshare
+openpyxl
+tushare
