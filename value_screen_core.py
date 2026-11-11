@@ -34,6 +34,15 @@ PCT_WIN = 1250    # 5 年滚动分位（~252*5）
 PCT_MINP = 252    # 至少 1 年数据才出分位
 CRIT = ['ROA>0', 'CFO>0', 'ΔROA>0', 'CFO>NI', 'Δ负债<0', 'Δ毛利>0', 'Δ周转>0']
 
+# 原生库崩溃的退出码：Windows 0xC0000005 访问冲突 / 0xC000001D 非法指令 / 0xC0000409；POSIX 的 SIGSEGV / SIGILL / SIGABRT
+NATIVE_CRASH = {3221225477, 3221225501, 3221226505, -1073741819, -1073741795, -1073740791,
+                -11, -4, -6, 139, 132, 134}
+
+
+def _read_pq(path, columns=None) -> pd.DataFrame:
+    """读 parquet。引擎可用环境变量 VS_PARQUET_ENGINE 指定（pyarrow / fastparquet；默认 auto = pyarrow）。"""
+    return pd.read_parquet(path, columns=columns, engine=os.environ.get("VS_PARQUET_ENGINE", "auto"))
+
 
 class DataMissing(RuntimeError):
     pass
@@ -79,7 +88,7 @@ def _read_dir(d: Path, last: Optional[int] = None, columns=None) -> pd.DataFrame
     fs = sorted(d.glob("*.parquet")) if d.exists() else []
     if last:
         fs = fs[-last:]
-    parts = [pd.read_parquet(f, columns=columns) if columns else pd.read_parquet(f) for f in fs]
+    parts = [_read_pq(f, columns) for f in fs]
     parts = [p for p in parts if len(p)]
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
@@ -102,7 +111,7 @@ def load_daily_basic(exclude_bj: bool = False) -> Basic:
     cols = ["ts_code", "pe_ttm", "pb", "circ_mv"]
 
     def _read(f):
-        df = pd.read_parquet(f, columns=cols)
+        df = _read_pq(f, cols)
         if exclude_bj:
             df = df[~df["ts_code"].astype(str).str.endswith(".BJ")]
         df = df.assign(code=df["ts_code"].astype(str).str[:6]).drop_duplicates("code", keep="last")
@@ -127,7 +136,7 @@ def load_daily_basic(exclude_bj: bool = False) -> Basic:
 def load_industry() -> pd.DataFrame:
     if not vd.IND_FILE.exists():
         raise DataMissing("industry")
-    return pd.read_parquet(vd.IND_FILE).drop_duplicates("code").set_index("code")
+    return _read_pq(vd.IND_FILE).drop_duplicates("code").set_index("code")
 
 
 # ───────────────────────── value：5 年分位 + 中性化 ─────────────────────────
@@ -340,8 +349,9 @@ class ScreenFailed(RuntimeError):
         rc = self.returncode
         if rc in (-9, 137):
             return "进程被系统强行终止，最常见原因是内存不足（OOM）。"
-        if rc in (3221225477, -1073741819, -11, 139):
-            return "底层库崩溃（访问冲突 / 段错误）。请把下面的错误信息和 pandas / numpy / pyarrow 版本发给我。"
+        if rc in NATIVE_CRASH:
+            return ("底层库崩溃（访问冲突 / 非法指令 / 段错误），通常是 pyarrow 与本机 CPU 或安装环境不兼容。"
+                    "程序已自动尝试过备用读法（见下方说明）；仍失败的话请看下面的调用栈。")
         if rc == "timeout":
             return "运行超时（默认 15 分钟）。"
         return "脚本报错，详见下面的错误信息。"
@@ -354,34 +364,66 @@ def _read_trace(p: Path) -> str:
         return ""
 
 
+def _env_attempts() -> list:
+    """pyarrow 读 parquet 在个别机器上会因 CPU 指令集（SIMD）问题"非法指令"崩溃。
+    依次尝试：默认 → 关闭 Arrow 的 SIMD 加速 → 再换 fastparquet 引擎（装了才试）。"""
+    import importlib.util
+    seq = [("默认设置", {}),
+           ("关闭 Arrow SIMD 加速 (ARROW_USER_SIMD_LEVEL=NONE)", {"ARROW_USER_SIMD_LEVEL": "NONE"})]
+    if importlib.util.find_spec("fastparquet") is not None:
+        seq.append(("关闭 SIMD + fastparquet 引擎",
+                    {"ARROW_USER_SIMD_LEVEL": "NONE", "VS_PARQUET_ENGINE": "fastparquet"}))
+    return seq
+
+
+_GOOD_ENV: Optional[dict] = None    # 上次成功的环境变量组合：之后直接用它，不必每次重试
+
+
 def run_in_subprocess(p: Optional[Params] = None, timeout: int = 900, cmd_prefix=None) -> Result:
     """在独立 Python 进程里跑选股（读数据、算分位、回归都在子进程）。
-    好处：内存吃紧或底层库崩溃时只会让子进程退出，网页服务不会掉线，页面还能显示失败原因。"""
+    好处：内存吃紧或底层库崩溃时只会让子进程退出，网页服务不会掉线，页面还能显示失败原因。
+    子进程若因底层库崩溃（NATIVE_CRASH）退出，会换一组环境变量自动重试（见 _env_attempts）。"""
+    global _GOOD_ENV
     p = p or Params()
     here = Path(__file__).resolve()
-    with tempfile.TemporaryDirectory() as td:
-        out = os.path.join(td, "result.pkl")
-        tpath = trace_path()
-        tpath.parent.mkdir(parents=True, exist_ok=True)
-        cmd = list(cmd_prefix or [sys.executable, str(here)]) + [
-            "--out", out, "--trace", str(tpath), "--excl", str(p.excl_small_pct), "--cheap", str(p.cheap_pct),
-            "--fmin", str(int(p.fscore_min)), "--amt-min", str(p.amt_min_yi)]
-        if p.exclude_bj:
-            cmd.append("--exclude-bj")
-        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                  timeout=timeout, cwd=str(here.parent), env=env)
-        except subprocess.TimeoutExpired as e:
-            raise ScreenFailed("timeout", str(e.stderr or "")[-3000:], _read_trace(tpath)) from e
-        if proc.returncode == 2:
-            raise DataMissing((proc.stderr or "").replace("DATA_MISSING:", "").strip() or "数据不足")
-        if proc.returncode != 0 or not os.path.exists(out):
-            raise ScreenFailed(proc.returncode, (proc.stderr or "")[-3000:], _read_trace(tpath))
-        with open(out, "rb") as f:
-            d = pickle.load(f)
-    return Result(candidates=d["candidates"], asof=d["asof"], log=d["log"], counts=d["counts"],
-                  csv_path=Path(d["csv_path"]) if d.get("csv_path") else None)
+    tpath = trace_path()
+    tpath.parent.mkdir(parents=True, exist_ok=True)
+    attempts = [("上次成功的设置", _GOOD_ENV)] if _GOOD_ENV is not None else _env_attempts()
+    tried, err = [], None
+    for label, extra in attempts:
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "result.pkl")
+            cmd = list(cmd_prefix or [sys.executable, str(here)]) + [
+                "--out", out, "--trace", str(tpath), "--excl", str(p.excl_small_pct), "--cheap", str(p.cheap_pct),
+                "--fmin", str(int(p.fscore_min)), "--amt-min", str(p.amt_min_yi)]
+            if p.exclude_bj:
+                cmd.append("--exclude-bj")
+            env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+            env.update(extra)
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                      timeout=timeout, cwd=str(here.parent), env=env)
+            except subprocess.TimeoutExpired as e:
+                raise ScreenFailed("timeout", str(e.stderr or "")[-3000:], _read_trace(tpath)) from e
+            if proc.returncode == 2:
+                raise DataMissing((proc.stderr or "").replace("DATA_MISSING:", "").strip() or "数据不足")
+            if proc.returncode == 0 and os.path.exists(out):
+                with open(out, "rb") as f:
+                    d = pickle.load(f)
+                _GOOD_ENV = dict(extra)
+                res = Result(candidates=d["candidates"], asof=d["asof"], log=d["log"], counts=d["counts"],
+                             csv_path=Path(d["csv_path"]) if d.get("csv_path") else None)
+                if tried:
+                    res.log.insert(0, f"⚠ 前 {len(tried)} 次因底层库崩溃失败（{'、'.join(tried)}），已改用：{label}")
+                return res
+            err = ScreenFailed(proc.returncode, (proc.stderr or "")[-3000:], _read_trace(tpath))
+            tried.append(label)
+            if proc.returncode not in NATIVE_CRASH:
+                break    # 普通脚本报错：换环境变量没用，直接报
+    _GOOD_ENV = None
+    if len(tried) > 1:
+        err.stderr = "已依次尝试：" + " → ".join(tried) + "，都崩溃了。\n" + err.stderr
+    raise err
 
 
 # ───────────────────────── 命令行入口（页面用子进程调用，崩溃不会拖垮网页服务） ─────────────────────────
