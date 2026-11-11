@@ -1,8 +1,22 @@
+# ashare_dashboard dependencies:  pip install -r requirements.txt
+
+# --- web app + data handling ---
 streamlit>=1.50
 pandas>=2.1
 numpy
 plotly
 requests
+
+# --- data sources ---
 akshare
-openpyxl
 tushare
+openpyxl
+
+# --- value + quality screen: daily_basic etc. are cached as parquet files ---
+pyarrow
+# Fallback parquet engine. On some machines pyarrow crashes ("illegal instruction",
+# exit code 3221225501) when reading parquet; the screen page then retries with fastparquet.
+fastparquet
+
+# --- tests (optional): python -m pytest tests/test_value_screen.py -q ---
+pytest
