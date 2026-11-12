@@ -10,10 +10,11 @@ import autoupdate
 
 if "--print-schtasks" in sys.argv:
     print(autoupdate.schtasks_command())
+    print(autoupdate.schtasks_morning_command())
     sys.exit(0)
 
 run_it, why = autoupdate.should_run(force="--force" in sys.argv)
 print("更新" if run_it else "跳过", "-", why)
 if run_it:
-    log = autoupdate.run()
+    log = autoupdate.run(full="--force" in sys.argv)
     print("\n".join(log))

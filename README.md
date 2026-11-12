@@ -12,6 +12,7 @@
   2. 网页关着也想每天更新：用 Windows 计划任务运行 `auto_update.py`（工作日 18:00，非交易日/已最新自动跳过）。
      创建命令：`python auto_update.py --print-schtasks` 打印后复制到 PowerShell 执行；手动试跑 `python auto_update.py --force`。
      计划任务读不到终端环境变量，token 请在数据页「保存到本地文件」。
+  2b. **早间补数据**：融资融券、ETF份额要到次日早晨（约 08:30–09:00）才披露，所以收盘当晚这两类通常还是前一天的，页面顶部会用黄色条明确标出「不是最新」。再用一个计划任务 `AStockMorningUpdate`（每个工作日 07:00 起每 30 分钟一次，到 12:00），只补这两类，数据齐了自动跳过；创建命令同样由 `python auto_update.py --print-schtasks` 打印（第二条）。
   3. 所有更新（手动、自动、计划任务）都会记录到 `data/cache/logs/update.log`，数据页可看。
 - 融资/ETF份额披露常晚一天，新鲜度判断里允许这两类落后 1 个交易日。
 

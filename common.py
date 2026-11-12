@@ -103,12 +103,22 @@ def render_freshness(expanded=False, link=True):
     idx_row = df[df["数据"].str.startswith("指数日线")]
     last = idx_row["最新日期"].iloc[0] if len(idx_row) else None
     bad = df[df["核心"] & df["状态"].str.startswith(("⚠️", "❌"))]
+    _lag = pd.to_numeric(df["落后(交易日)"], errors="coerce").fillna(0)
+    soft = df[(_lag > 0) & ~df.index.isin(bad.index)]      # 晚于应有日期、但属于"次日披露"的正常延迟
     if last is None or last != last:
         head = "数据状态：❌ 没有指数日线，请到「数据」页更新"
         box = st.error
     elif len(bad):
         head = (f"数据状态：⚠️ 日线最新到 **{pd.Timestamp(last).date()}**，应有 **{pd.Timestamp(exp).date() if exp is not None else '—'}**；"
                 f"落后/缺失：{'、'.join(bad['数据'].str.split('(').str[0])}")
+        box = st.warning
+    elif len(soft):
+        items = "；".join(f"{str(r['数据']).split('(')[0]}（只到 {pd.Timestamp(r['最新日期']).date()}）"
+                          for _, r in soft.iterrows())
+        head = (f"数据状态：⏳ 日线最新到 **{pd.Timestamp(last).date()}**，但以下数据**不是最新**（应有 "
+                f"**{pd.Timestamp(exp).date() if exp is not None else '—'}**）：{items}。"
+                "融资融券 / ETF份额通常次日早晨才披露，早间自动更新（默认 07:00 起每 30 分钟重试）会补上；"
+                "在此之前相关列用的是旧数据。")
         box = st.warning
     else:
         head = f"数据状态：✅ 日线最新到 **{pd.Timestamp(last).date()}**（应有 {pd.Timestamp(exp).date() if exp is not None else '—'}），各数据均已更新"

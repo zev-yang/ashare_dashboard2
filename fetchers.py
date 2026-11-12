@@ -415,26 +415,42 @@ FETCHERS = {"cffex_rank": _with_sources(fetch_cffex_rank_day, tsrc.fut_rank_day)
             "etf_shares": fetch_etf_shares_day}
 
 
-def update_range(name: str, start, end, progress=None) -> list:
-    """按交易日逐日抓取并入库，已有的日期跳过。开头连续 3 天都因同一原因失败时提前停止，不再刷屏。"""
+REFRESH_LAST = 3     # 增量更新时，已入库的最近 N 个交易日也重抓覆盖（交易所/数据源可能先放出一部分，之后才补全）
+
+
+def update_range(name: str, start, end, progress=None, refresh_last: int = 0) -> list:
+    """按交易日逐日抓取并入库。已有的日期默认跳过；refresh_last>0 时，已入库的最近 N 个交易日会重新抓取并覆盖
+    （避免"早上抓到的是不完整的当日数据，之后再点下载却因日期已存在被跳过"）。重抓不到（尚未发布）不算错误，旧数据保留。
+    开头连续 3 天都因同一原因失败时提前停止，不再刷屏。"""
+    cal = trading_days(start, end)
     have = set(read_ds(name)["date"].dt.date)
-    days = [d for d in trading_days(start, end) if d.date() not in have]
-    log, ok, fail, first_errs, stopped = [], 0, 0, [], False
+    have_days = [d for d in cal if d.date() in have]
+    refresh = {d.date() for d in have_days[-refresh_last:]} if refresh_last else set()
+    days = [d for d in cal if d.date() not in have or d.date() in refresh]
+    log, ok, fail, refreshed, first_errs, stopped = [], 0, 0, 0, [], False
     for i, d in enumerate(days):
+        again = d.date() in refresh
         try:
-            ok += 1 if append_ds(name, FETCHERS[name](d)) else 0
+            n = append_ds(name, FETCHERS[name](d))
+            if again:
+                refreshed += 1 if n else 0
+            else:
+                ok += 1 if n else 0
         except Exception as e:  # noqa
-            fail += 1
-            if fail <= 3:
-                log.append(f"  {d.date()}: {explain(e)}")
-            if ok == 0:
-                first_errs.append(str(e))
-                if len(first_errs) >= 3 and len(set(first_errs[-3:])) == 1:
-                    stopped = True
-                    break
+            if again:
+                pass        # 重抓不到：保留已有数据，不计失败
+            else:
+                fail += 1
+                if fail <= 3:
+                    log.append(f"  {d.date()}: {explain(e)}")
+                if ok == 0:
+                    first_errs.append(str(e))
+                    if len(first_errs) >= 3 and len(set(first_errs[-3:])) == 1:
+                        stopped = True
+                        break
         if progress:
             progress((i + 1) / max(len(days), 1), f"{name} {d.date()}")
-    head = f"{name}: 新增 {ok} 个交易日，失败/尚未发布 {fail} 天"
+    head = f"{name}: 新增 {ok} 个交易日" + (f"，重抓最近 {refreshed} 天" if refresh_last else "") + f"，失败/尚未发布 {fail} 天"
     if stopped:
         head += f"；连续失败原因相同，已停止（共 {len(days)} 天待抓）。可修好后重试，或在侧边栏手动导入官网文件"
     log.insert(0, head)
@@ -466,7 +482,7 @@ def _incremental_by_day(name, df, end, backfill_days, progress):
     else:
         cal = trading_days(end - pd.Timedelta(days=int(backfill_days * 1.6) + 10), end)
         start = cal[-backfill_days] if len(cal) > backfill_days else cal[0]
-    return update_range(name, start, end, progress)
+    return update_range(name, start, end, progress, refresh_last=REFRESH_LAST)
 
 
 def update_index_cons(progress=None) -> list:
@@ -737,6 +753,21 @@ def update_all(backfill_days=60, include_sector=True, include_cons=False, includ
         ("ETF份额", lambda p: incremental_update("etf_shares", backfill_days, p)),
         ("⑤ 外资代理", lambda p: download_proxies(p)),
     ]
+    log = []
+    for i, (name, fn) in enumerate(steps):
+        sub = (lambda frac, text, i=i, name=name: progress((i + frac) / len(steps), f"{name} · {text}")) if progress else None
+        try:
+            log += fn(sub)
+        except Exception as e:  # noqa
+            log.append(f"{name}: 整步失败 {explain(e)}")
+    return log
+
+
+# ───────────── 早间补数据（只补次日早晨才披露的两类）─────────────
+def update_morning(backfill_days=60, progress=None) -> list:
+    """融资融券、ETF份额要到次日早晨才披露：早间只补这两类，不重跑日线 / 期指 / 外资代理。"""
+    steps = [("① 融资融券", lambda p: download_margin(backfill_days, p)),
+             ("ETF份额", lambda p: incremental_update("etf_shares", backfill_days, p))]
     log = []
     for i, (name, fn) in enumerate(steps):
         sub = (lambda frac, text, i=i, name=name: progress((i + frac) / len(steps), f"{name} · {text}")) if progress else None

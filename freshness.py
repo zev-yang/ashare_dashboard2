@@ -47,7 +47,7 @@ def _row(name, last, expected, detail="", allowed=0, core=True):
     if lag == 0:
         st_ = "✅ 最新"
     elif lag <= allowed:
-        st_ = f"✅ 最新（披露延迟 {lag} 日，正常）"
+        st_ = f"⏳ 非最新：晚 {lag} 个交易日（交易所次日早晨披露）"
     else:
         st_ = f"⚠️ 落后 {lag} 个交易日"
     return {"数据": name, "最新日期": pd.Timestamp(last), "应有日期": expected, "落后(交易日)": lag, "状态": st_,
@@ -65,7 +65,8 @@ def _group_last(codes, label):
     return min(have.values()), detail
 
 
-def collect(now=None, expected=None) -> pd.DataFrame:
+def collect(now=None, expected=None, strict=False) -> pd.DataFrame:
+    """strict=True（早间补数据用）：融资融券 / ETF份额也必须到 expected，不再允许晚一天。"""
     expected = expected if expected is not None else expected_latest(now)
     rows = []
     idx_codes = [v["code"] for v in config.INDEXES.values()]
@@ -81,7 +82,7 @@ def collect(now=None, expected=None) -> pd.DataFrame:
                       ("ETF份额", "etf_shares")):
         df = fetchers.read_ds(key)
         last = df["date"].max() if len(df) else None
-        rows.append(_row(name, last, expected, f"{df['date'].nunique()} 个交易日" if len(df) else "", ALLOWED_LAG.get(name, 0)))
+        rows.append(_row(name, last, expected, f"{df['date'].nunique()} 个交易日" if len(df) else "", 0 if strict else ALLOWED_LAG.get(name, 0)))
     pr = fetchers.read_ds("proxy_daily")
     for sym, g in pr.groupby("symbol"):
         last = g["date"].max()
