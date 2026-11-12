@@ -129,6 +129,43 @@ with tabs[0]:
                      "空单性质": label, "偏多信号": sum(1 for _, v in sig if v > 0), "偏空信号": sum(1 for _, v in sig if v < 0)})
     show(pd.DataFrame(rows), pct_cols=["当日", "本周", "本月", "融资买入占比", "融资占比分位", "年化基差"],
          num_cols=["ETF近5日净申购(亿)", "前20空单5日增量(亿)"], color_cols=["当日", "本周", "本月", "ETF近5日净申购(亿)"])
+    # ── 数据时效 / 缺失原因：哪些列用的是旧数据、为什么是"—" ──
+    _asof = pd.Timestamp(asof)
+    _stale = []
+    for _lab, _df_, _cols in (("融资融券", margin, "融资买入占比、融资占比分位"), ("ETF份额", shares, "ETF近5日净申购"),
+                              ("期指持仓排名", rank, "前20空单5日增量、空单性质"), ("期指日行情", fdaily, "年化基差")):
+        if len(_df_) and pd.Timestamp(_df_["date"].max()) < _asof:
+            _stale.append(f"**{_lab}** 只到 {pd.Timestamp(_df_['date'].max()).date()}（统计截止日 {_asof.date()}）→ 影响列：{_cols}")
+    if _stale:
+        st.warning("⏳ 以下数据**不是最新**，对应列用的是更早的数据（融资融券 / ETF份额通常次日早晨才披露，之后的更新会补上）：\n\n- "
+                   + "\n- ".join(_stale))
+    _why = []
+    for _nm, _info in IDX.items():
+        _m = mg_sum.get(_nm) or {}
+        if "ratio" in _m:
+            continue
+        if not len(margin):
+            _why.append("融资融券明细是空的（「数据」页点 ①）")
+            break
+        if not len(cons):
+            _why.append("没有指数成分股名单（「数据」页点「指数成分股名单」）")
+            break
+        _cc = cons.loc[cons["index_code"] == _info["code"], "code"].tolist()
+        if not _cc:
+            _why.append(f"{_nm}：没有成分股名单（「数据」页点「指数成分股名单」）")
+            continue
+        if not margin["code"].isin(_cc).any():
+            _why.append(f"{_nm}：融资融券明细里一只成分股都没匹配上（股票代码格式不一致？）")
+            continue
+        _amt = amount_panel(tuple(_cc), S)
+        _na = _amt.shape[1] if len(_amt) else 0
+        if _na == 0:
+            _why.append(f"{_nm}：成分股 {len(_cc)} 只，本地一只都没有带成交额的日线，算不出占比（「数据」页点 ⑥ 补日线）")
+        else:
+            _why.append(f"{_nm}：成分股 {len(_cc)} 只里本地有成交额的 {_na} 只，但和融资数据没有重叠的交易日"
+                        f"（成交额到 {pd.Timestamp(_amt.index.max()).date()}，融资到 {pd.Timestamp(margin['date'].max()).date()}）")
+    if _why:
+        st.info("融资买入占比 / 分位显示为「—」的原因：\n\n- " + "\n- ".join(_why))
     st.markdown(f"**避险防御篮子相对沪深300**：当日 {pct(def_rel['day'])} ｜ 本周 {pct(def_rel['wtd'])} ｜ 本月 {pct(def_rel['mtd'])}"
                 f"（防御篮子 = 角色为\"防御\"的板块成分股等权；正值表示防御跑赢大盘）")
     problems = []

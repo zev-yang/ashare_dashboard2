@@ -106,7 +106,10 @@ with st.container(border=True):
         st.write(("会更新：" if go else "不会更新：") + why)
     st.markdown("**网页关着时也要每天自动更新** → 用 Windows 计划任务运行 `auto_update.py`"
                 "（每个工作日 18:00，非交易日/已最新会自动跳过）。在 PowerShell 里执行下面这一行创建任务：")
-    st.code(autoupdate.schtasks_command(), language="powershell")
+    st.code(autoupdate.schtasks_command() + "\n\n" + autoupdate.schtasks_morning_command(), language="powershell")
+    st.caption("上面两条：①「AStockAutoUpdate」每个工作日 18:00 完整更新；②「AStockMorningUpdate」每个工作日 07:00 起每 30 分钟检查一次、到 12:00 为止，"
+               "只补融资融券 + ETF份额（交易所约 08:30–09:00 才披露，所以 07:00 先试、之后重试），数据齐了就自动跳过。"
+               "电脑需要在这些时间开机且未休眠；要让它能唤醒电脑，到「任务计划程序」里勾选「唤醒计算机以运行此任务」。")
     st.caption("计划任务读不到你终端里的环境变量，Tushare token 请在下面「数据源」里点「保存到本地文件」。"
                "手动试跑：`python auto_update.py --force`。")
 
