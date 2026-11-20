@@ -1,14 +1,16 @@
-"""全局配置。板块成分、ETF 代码、阈值都在这里改，不需要动其它文件。"""
+﻿"""全局配置。板块成分、ETF 代码、阈值都在这里改，不需要动其它文件。"""
 import os
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
 # 演示模式：读 data_demo/ 里的模拟数据。只有 ASHARE_DEMO=1 且没有指定真实日线目录时才生效，
 # 避免"之前试过演示、环境变量还留在终端里"导致真实数据被演示模式覆盖。
+os.environ["ASHARE_DAILY_DIR"] = r"E:\ashare_data\daily"
 DEMO = os.environ.get("ASHARE_DEMO") == "1" and "ASHARE_DAILY_DIR" not in os.environ
 DATA_ROOT = BASE / ("data_demo" if DEMO else "data")
 # 本地日线目录：把你下载好的指数/ETF/个股日线 csv 放这里（可有子目录），或用环境变量指定
 DAILY_DIR = Path(os.environ.get("ASHARE_DAILY_DIR", DATA_ROOT / "daily"))
+#DAILY_DIR = Path(r"D:\ashare_data\daily")
 CACHE_DIR = DATA_ROOT / "cache"
 for _p in (DAILY_DIR, CACHE_DIR):
     _p.mkdir(parents=True, exist_ok=True)
