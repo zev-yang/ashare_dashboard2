@@ -26,10 +26,12 @@ SCHEMAS = {
     "etf_shares": ["date", "code", "name", "shares"],
     "index_cons": ["index_code", "code", "name"],
     "proxy_daily": ["date", "symbol", "open", "high", "low", "close", "volume"],
+    "market_avg": ["date", "n", "raw_avg", "sum_close", "sum_pre", "eq_ret"],
+    "sector_px": ["date", "code", "close", "pre_close"],
 }
 KEYS = {"cffex_rank": ["date", "contract", "rank"], "cffex_daily": ["date", "contract"],
         "margin": ["date", "code"], "etf_shares": ["date", "code"], "index_cons": ["index_code", "code"],
-        "proxy_daily": ["date", "symbol"]}
+        "proxy_daily": ["date", "symbol"], "market_avg": ["date"], "sector_px": ["date", "code"]}
 
 
 # ───────────── 缓存 ─────────────
@@ -728,6 +730,33 @@ def download_proxies(progress=None) -> list:
     return log
 
 
+
+def download_market_avg(backfill_days: int = 60, full_history: bool = False, progress=None) -> list:
+    """⑦ 全A平均股价日度汇总 + 板块成分股 close/pre_close（基于 Tushare daily 按日全市场）。"""
+    if not tsrc.available():
+        return ["【⑦ 全A平均股价】未配置 Tushare token（免费源不支持按日拉取全市场历史，请在「数据」页配置 token）"]
+    if getattr(config, "SOURCE", "auto") == "free":
+        return ["【⑦ 全A平均股价】当前数据源设为「仅免费源」，已跳过（需要 Tushare）"]
+    try:
+        return tsrc.update_market_avg(
+            start_date=config.PX_START if full_history else None,
+            backfill_days=backfill_days,
+            progress=progress,
+        )
+    except Exception as e:  # noqa
+        return [f"【⑦ 全A平均股价】失败：{explain(e)}"]
+
+
+def download_sector_px(progress=None) -> list:
+    """仅补齐 config.SECTORS 成分股自 PX_START 起的 close/pre_close（约45次调用，1分钟内完成）。"""
+    if not tsrc.available():
+        return ["【板块复权日线】未配置 Tushare token"]
+    try:
+        return tsrc.update_sector_px_only(progress=progress)
+    except Exception as e:  # noqa
+        return [f"【板块复权日线】失败：{explain(e)}"]
+
+
 # ───────────── 一键更新全部 ─────────────
 def download_local_stocks(progress=None) -> list:
     """⑥ 用 Tushare 把你本地日线目录里的个股日线补到最新（追加）。需要 token。"""
@@ -752,6 +781,7 @@ def update_all(backfill_days=60, include_sector=True, include_cons=False, includ
         ("① 融资融券", lambda p: download_margin(backfill_days, p)),
         ("ETF份额", lambda p: incremental_update("etf_shares", backfill_days, p)),
         ("⑤ 外资代理", lambda p: download_proxies(p)),
+        ("⑦ 全A平均股价", lambda p: download_market_avg(backfill_days, full_history=False, progress=p)),
     ]
     log = []
     for i, (name, fn) in enumerate(steps):

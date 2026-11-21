@@ -11,6 +11,7 @@ import common  # noqa: E402 (必须在 set_page_config 之后导入)
 
 pg = st.navigation([
     st.Page("views/dashboard.py", title="指数分析", icon="📈", default=True),
+    st.Page("views/avg_price.py", title="平均股价对比", icon="⚖️"),
     st.Page("views/value_screen.py", title="价值质量选股", icon="💎"),
     st.Page("views/data.py", title="数据", icon="🗄️"),
 ])

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import gc
 import os
 import time
 from pathlib import Path
@@ -55,6 +56,18 @@ FUND_KEEP = FUND_FIELDS.split(",")
 FUND_NUM = [c for c in FUND_KEEP if c not in ("ts_code", "ann_date", "end_date")]
 
 Progress = Optional[Callable[[float, str], None]]
+
+NATIVE_CRASH = {3221225477, 3221225501, 3221226505, -1073741819, -1073741795, -1073740791,
+                -11, -4, -6, 139, 132, 134}
+
+
+def _read_pq(path, columns=None) -> pd.DataFrame:
+    return pd.read_parquet(path, columns=columns, engine=os.environ.get("VS_PARQUET_ENGINE", "auto"))
+
+
+def _to_pq(df: pd.DataFrame, path: Path):
+    df.to_parquet(path, index=False, engine=os.environ.get("VS_PARQUET_ENGINE", "auto"))
+
 
 
 # ───────────────────────── 限速 / 重试 / 分页 ─────────────────────────
@@ -178,7 +191,7 @@ def _pull_by_date(api, out_dir: Path, days: list, label: str, progress: Progress
             if d not in recent:
                 (out_dir / f"{d}.empty").touch()
         else:
-            df.to_parquet(out_dir / f"{d}.parquet", index=False)
+            _to_pq(df, out_dir / f"{d}.parquet")
             wrote += 1
         if progress and (i % 10 == 0 or i == len(todo)):
             progress(i / len(todo), f"{label} {i}/{len(todo)}（{d}）")
@@ -207,7 +220,7 @@ def update_industry(progress: Progress = None) -> list:
     allf["code"] = allf["ts_code"].astype(str).str[:6]
     allf = allf.drop_duplicates("code", keep="first")
     DIRS["industry"].mkdir(parents=True, exist_ok=True)
-    allf[["code", "ts_code", "name", "industry", "market", "list_date"]].to_parquet(IND_FILE, index=False)
+    _to_pq(allf[["code", "ts_code", "name", "industry", "market", "list_date"]], IND_FILE)
     return [f"【行业】{len(allf)} 只股票，{allf['industry'].notna().sum()} 只有行业标签，"
             f"{allf['industry'].nunique()} 个一级行业"]
 
@@ -262,10 +275,10 @@ def _save_fund(df: pd.DataFrame) -> int:
     for per, g in df.groupby("end_date"):
         p = DIRS["fundamentals"] / f"{per}.parquet"
         if p.exists():
-            g = pd.concat([pd.read_parquet(p), g], ignore_index=True)
+            g = pd.concat([_read_pq(p), g], ignore_index=True)
         g = (g.sort_values(["ts_code", "ann_date"])
               .drop_duplicates(["ts_code", "end_date"], keep="first"))
-        g[[c for c in FUND_KEEP if c in g.columns]].to_parquet(p, index=False)
+        _to_pq(g[[c for c in FUND_KEEP if c in g.columns]], p)
         n += 1
     return n
 
@@ -360,7 +373,7 @@ def update_cashflow(progress: Progress = None) -> list:
             continue
         df = df[_is_sh_sz(df["ts_code"])] if len(df) else df
         if len(df):
-            df.to_parquet(f, index=False)
+            _to_pq(df, f)
         if progress:
             progress(k / len(years), f"现金流 {per}")
     return log + [f"【现金流】财年 {years[0]}–{years[-1]} 已就绪"]
@@ -394,11 +407,13 @@ STEPS = [
 def update_all(progress: Progress = None) -> list:
     """全部增量更新。某一步失败不影响其它步（分片已在盘上，重跑会续上）。"""
     log = []
-    for label, fn in STEPS:
+    for i, (label, fn) in enumerate(STEPS):
+        sub = (lambda frac, text, i=i, label=label: progress((i + frac) / len(STEPS), f"{label} · {text}")) if progress else None
         try:
-            log += fn(progress)
+            log += fn(sub)
         except Exception as e:  # noqa
             log.append(f"【{label}】中止：{e!r}（已下载的分片保留，重跑会续上）")
+        gc.collect()
     return log
 
 
@@ -459,3 +474,112 @@ def data_status(today=None) -> pd.DataFrame:
         if r["数据集"] in ("分红", "近期成交额") and r["状态"].startswith("❌"):
             r["状态"] = "⚪ 可选，未下载"
     return pd.DataFrame(rows)
+
+
+def _env_attempts() -> list:
+    import importlib.util
+    seq = [("默认设置", {}),
+           ("关闭 Arrow SIMD 加速", {"ARROW_USER_SIMD_LEVEL": "NONE"})]
+    if importlib.util.find_spec("fastparquet") is not None:
+        seq.append(("关闭 SIMD + fastparquet 引擎",
+                    {"ARROW_USER_SIMD_LEVEL": "NONE", "VS_PARQUET_ENGINE": "fastparquet"}))
+    return seq
+
+
+_GOOD_ENV: Optional[dict] = None
+
+
+def run_update_in_subprocess(step: str = "all", progress: Progress = None, timeout: int = 3600) -> list:
+    """在独立子进程里执行数据下载/parquet写入，避免 pyarrow 崩溃或内存波动拖垮 Streamlit 服务。"""
+    global _GOOD_ENV
+    import pickle
+    import subprocess
+    import sys
+    import tempfile
+
+    here = Path(__file__).resolve()
+    attempts = [("上次成功的设置", _GOOD_ENV)] if _GOOD_ENV is not None else _env_attempts()
+    tried, last_err = [], ""
+    for label, extra in attempts:
+        with tempfile.TemporaryDirectory() as td:
+            out_pkl = Path(td) / "update_log.pkl"
+            cmd = [sys.executable, "-u", str(here), "--step", str(step), "--out", str(out_pkl)]
+            env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1")
+            env.update(extra)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=str(here.parent),
+                env=env,
+            )
+            tail = []
+            try:
+                assert proc.stdout is not None
+                for raw in proc.stdout:
+                    line = raw.rstrip("\r\n")
+                    if line.startswith("PROGRESS:"):
+                        parts = line.split(":", 2)
+                        if len(parts) == 3 and progress:
+                            try:
+                                progress(float(parts[1]), parts[2])
+                            except Exception:  # noqa
+                                pass
+                    elif line:
+                        tail.append(line)
+                        if len(tail) > 40:
+                            tail.pop(0)
+                rc = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                return [f"【更新超时】超过 {timeout} 秒未完成（已下载的分片已保存，再点一次会继续）"]
+
+            if rc == 0 and out_pkl.exists():
+                with open(out_pkl, "rb") as f:
+                    logs = pickle.load(f)
+                _GOOD_ENV = dict(extra)
+                if tried:
+                    logs.insert(0, f"⚠ 前 {len(tried)} 次因底层库崩溃失败（{'、'.join(tried)}），已改用：{label}（分片已自动续传）")
+                return logs
+
+            tried.append(label)
+            last_err = f"子进程退出码 {rc}\n" + "\n".join(tail[-20:])
+            if rc not in NATIVE_CRASH:
+                break
+    _GOOD_ENV = None
+    return [f"【更新中断】已尝试：{' → '.join(tried)}，已下载的分片保留，再点一次会续传。\n{last_err}"]
+
+
+def _cli(argv=None) -> int:
+    import argparse
+    import pickle
+    import traceback
+
+    ap = argparse.ArgumentParser(description="value_screen_data 子进程更新入口")
+    ap.add_argument("--step", default="all")
+    ap.add_argument("--out", required=True)
+    a = ap.parse_args(argv)
+
+    def cb(frac, text):
+        print(f"PROGRESS:{min(max(float(frac), 0.0), 1.0):.4f}:{text}", flush=True)
+
+    try:
+        if a.step == "all":
+            logs = update_all(cb)
+        else:
+            _, fn = STEPS[int(a.step)]
+            logs = fn(cb)
+    except Exception:  # noqa
+        traceback.print_exc()
+        return 1
+    with open(a.out, "wb") as f:
+        pickle.dump(logs, f)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli())

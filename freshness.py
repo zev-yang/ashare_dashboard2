@@ -83,6 +83,10 @@ def collect(now=None, expected=None, strict=False) -> pd.DataFrame:
         df = fetchers.read_ds(key)
         last = df["date"].max() if len(df) else None
         rows.append(_row(name, last, expected, f"{df['date'].nunique()} 个交易日" if len(df) else "", 0 if strict else ALLOWED_LAG.get(name, 0)))
+    mkt = fetchers.read_ds("market_avg")
+    last_mkt = mkt["date"].max() if len(mkt) else None
+    rows.append(_row("全A平均股价", last_mkt, expected,
+                     f"{mkt['date'].nunique()} 个交易日" if len(mkt) else "需点回补/更新", core=False))
     pr = fetchers.read_ds("proxy_daily")
     for sym, g in pr.groupby("symbol"):
         last = g["date"].max()

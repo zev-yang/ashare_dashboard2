@@ -328,3 +328,62 @@ def label_stats(frame: pd.DataFrame, index_close: pd.Series, horizon: int = 5) -
         rows.append({"标签": lab, "样本数": len(g), f"后{horizon}日均涨跌": g["fwd"].mean(),
                      "上涨占比": (g["fwd"] > 0).mean(), "按假设方向命中率": hit})
     return pd.DataFrame(rows).set_index("标签")
+# ───────────── 平均股价（除权修正链式回溯）─────────────
+def _chain_from_steps(raw_avg: pd.Series, step: pd.Series) -> pd.Series:
+    """以最后一天的真实算术均价为锚，按每日复权后涨跌幅链式回溯，消除除权跳空与停牌/新股噪声。"""
+    s = pd.DataFrame({"raw": raw_avg, "step": step}).dropna().sort_index()
+    if s.empty:
+        return pd.Series(dtype=float, index=pd.DatetimeIndex([]))
+    st_ = s["step"].where((s["step"] > 0) & np.isfinite(s["step"]), 1.0)
+    cum = st_.cumprod()
+    return s["raw"].iloc[-1] * cum / cum.iloc[-1]
+
+
+def market_avg_frame(mkt_df: pd.DataFrame, asof=None) -> pd.DataFrame:
+    """由 market_avg 数据集生成：adj_avg(除权修正算术均价)、eq_avg(等权复权均价)、raw_avg(原始均价)、n。"""
+    if mkt_df is None or mkt_df.empty:
+        return pd.DataFrame()
+    d = mkt_df.copy()
+    d["date"] = pd.to_datetime(d["date"])
+    d = d.sort_values("date").drop_duplicates("date", keep="last").set_index("date")
+    if asof is not None:
+        d = d[d.index <= pd.Timestamp(asof)]
+    if d.empty:
+        return pd.DataFrame()
+    step_pw = d["sum_close"] / d["sum_pre"].replace(0, np.nan)
+    step_eq = 1.0 + d["eq_ret"]
+    out = pd.DataFrame(index=d.index)
+    out["n"] = d["n"]
+    out["raw_avg"] = d["raw_avg"]
+    out["adj_avg"] = _chain_from_steps(d["raw_avg"], step_pw)
+    out["eq_avg"] = _chain_from_steps(d["raw_avg"], step_eq)
+    return out
+
+
+def basket_avg_frame(sector_px: pd.DataFrame, codes, asof=None) -> pd.DataFrame:
+    """用 (date, code, close, pre_close) 计算板块篮子的除权修正均价、等权复权均价、原始均价。"""
+    if sector_px is None or sector_px.empty:
+        return pd.DataFrame()
+    m = sector_px[sector_px["code"].isin(list(codes))].copy()
+    if m.empty:
+        return pd.DataFrame()
+    m["date"] = pd.to_datetime(m["date"])
+    if asof is not None:
+        m = m[m["date"] <= pd.Timestamp(asof)]
+    m = m[(m["close"] > 0) & (m["pre_close"] > 0)]
+    if m.empty:
+        return pd.DataFrame()
+    m["ret"] = m["close"] / m["pre_close"] - 1.0
+    g = m.groupby("date").agg(
+        n=("close", "count"),
+        raw_avg=("close", "mean"),
+        sum_close=("close", "sum"),
+        sum_pre=("pre_close", "sum"),
+        eq_ret=("ret", "mean"),
+    ).sort_index()
+    out = pd.DataFrame(index=g.index)
+    out["n"] = g["n"]
+    out["raw_avg"] = g["raw_avg"]
+    out["adj_avg"] = _chain_from_steps(g["raw_avg"], g["sum_close"] / g["sum_pre"].replace(0, np.nan))
+    out["eq_avg"] = _chain_from_steps(g["raw_avg"], 1.0 + g["eq_ret"])
+    return out

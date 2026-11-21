@@ -347,13 +347,16 @@ def update_local_stock_daily(progress=None, history_start=None, chunk_days=15) -
     if len(days) <= len(todo):
         log.append(f"  方式：按日批量（{len(days)} 次调用，替代逐只 {len(todo)} 次）")
         for i in range(0, len(days), chunk_days):
-            frames = []
+            frames, day_frames = [], []
             for d in days[i:i + chunk_days]:
                 df = call("daily", trade_date=_ymd(d))
                 if len(df):
                     frames.append(df)
+                    day_frames.append((_ymd(d), df))
                 if progress:
                     progress(min((days.index(d) + 1) / len(days), 1.0), f"本地日线 {d.date()}")
+            if day_frames:
+                record_avg_from_daily(day_frames)
             if not frames:
                 continue
             big = _to_std(pd.concat(frames, ignore_index=True), names)
@@ -396,6 +399,168 @@ def update_local_stock_daily(progress=None, history_start=None, chunk_days=15) -
     if discont:
         log.append(f"  ⚠️ {len(discont)} 只股票的本地文件最后收盘价与最新数据相差4倍以上，疑似文件内容不是该股票，已跳过不追加：{discont[:10]}")
     return log
+
+
+# ───────────── 全A平均股价 & 板块复权基准（除权修正用）─────────────
+def _sector_codes() -> set:
+    return {c for s in config.SECTORS.values() for c, _ in s["stocks"]}
+
+
+def _ipo_list_dates() -> dict:
+    """缓存全市场上市日期（含已退市），用于剔除新股上市首日（发行价→首日收盘的虚高跳涨）。"""
+    p = config.CACHE_DIR / "stock_list_dates.csv"
+    if p.exists() and (time.time() - p.stat().st_mtime) < 7 * 86400:
+        df = pd.read_csv(p, dtype={"ts_code": str, "list_date": str})
+        return dict(zip(df["ts_code"], df["list_date"]))
+    frames = []
+    for st_ in ("L", "D", "P"):
+        try:
+            df = call("stock_basic", exchange="", list_status=st_, fields="ts_code,list_date")
+            if len(df):
+                frames.append(df)
+        except Exception:  # noqa
+            continue
+    if not frames:
+        return {}
+    allf = pd.concat(frames, ignore_index=True).drop_duplicates("ts_code", keep="first")
+    allf.to_csv(p, index=False)
+    return dict(zip(allf["ts_code"], allf["list_date"]))
+
+
+def _summarize_day_for_avg(df: pd.DataFrame, d_ymd: str, ipo_map: dict, sec_codes: set):
+    """从单日全市场 daily 表提取：全A汇总行 + 板块个股 (date, code, close, pre_close)。"""
+    if df is None or df.empty:
+        return None, pd.DataFrame()
+    d = df.copy()
+    d["code"] = d["ts_code"].astype(str).str[:6]
+    d["close"] = pd.to_numeric(d["close"], errors="coerce")
+    d["pre_close"] = pd.to_numeric(d["pre_close"], errors="coerce")
+    d = d[(d["close"] > 0) & (d["pre_close"] > 0)].copy()
+    if ipo_map:
+        d = d[d["ts_code"].map(ipo_map).fillna("") != d_ymd]  # 剔除上市首日
+    if d.empty:
+        return None, pd.DataFrame()
+    dt_val = pd.to_datetime(d_ymd)
+    ret = d["close"] / d["pre_close"] - 1.0
+    mkt_row = {
+        "date": dt_val,
+        "n": int(len(d)),
+        "raw_avg": float(d["close"].mean()),
+        "sum_close": float(d["close"].sum()),
+        "sum_pre": float(d["pre_close"].sum()),
+        "eq_ret": float(ret.mean()),
+    }
+    sec = d[d["code"].isin(sec_codes)]
+    sec_df = pd.DataFrame({
+        "date": dt_val,
+        "code": sec["code"],
+        "close": sec["close"],
+        "pre_close": sec["pre_close"],
+    }) if len(sec) else pd.DataFrame()
+    return mkt_row, sec_df
+
+
+def record_avg_from_daily(day_frames: list):
+    """供 ⑥ 本地个股日线顺便写入全A平均股价缓存（零额外 API 调用）。"""
+    import fetchers
+    if not day_frames:
+        return
+    ipo_map, sec_codes = _ipo_list_dates(), _sector_codes()
+    mkt_rows, sec_parts = [], []
+    for d_ymd, df in day_frames:
+        mr, sd = _summarize_day_for_avg(df, d_ymd, ipo_map, sec_codes)
+        if mr is not None:
+            mkt_rows.append(mr)
+        if len(sd):
+            sec_parts.append(sd)
+    if mkt_rows:
+        fetchers.append_ds("market_avg", pd.DataFrame(mkt_rows))
+    if sec_parts:
+        fetchers.append_ds("sector_px", pd.concat(sec_parts, ignore_index=True))
+
+
+def update_market_avg(start_date=None, backfill_days: int = 60, progress=None, flush_every: int = 20) -> list:
+    """按交易日从 Tushare daily 拉取全市场，汇总保存至 market_avg.csv 与 sector_px.csv。
+    start_date=None 时仅做增量（已有则从最后10个交易日起补；为空则回补最近 backfill_days 日）。
+    start_date 指定（如 PX_START）时，按「由新到旧」回补缺失历史，每20天落盘一次，可随时中断续传。"""
+    import fetchers
+    latest = latest_ready_date()
+    old = fetchers.read_ds("market_avg")
+    have = set(old["date"].dt.date) if len(old) else set()
+    if start_date is None:
+        cal = trade_dates(pd.Timestamp(latest) - pd.Timedelta(days=int(backfill_days * 1.7) + 20), latest)
+        cal = cal[-backfill_days:] if len(cal) > backfill_days else cal
+        if len(old):
+            recent_cal = trade_dates(old["date"].max() - pd.Timedelta(days=30), latest)
+            cal = sorted(set(cal) | set(recent_cal[-11:]))
+        todo = list(reversed([d for d in cal if d.date() not in have]))
+    else:
+        cal = trade_dates(start_date, latest)
+        todo = list(reversed([d for d in cal if d.date() not in have]))
+    log = [f"【⑦ 全A平均股价】已缓存 {len(have)} 天；本次待补 {len(todo)} 个交易日（最新入库 {latest}）"]
+    if not todo:
+        return log
+    ipo_map, sec_codes = _ipo_list_dates(), _sector_codes()
+    mkt_buf, sec_buf, ok, fail = [], [], 0, 0
+    for i, d in enumerate(todo, 1):
+        d_ymd = _ymd(d)
+        try:
+            df = call("daily", trade_date=d_ymd)
+            mr, sd = _summarize_day_for_avg(df, d_ymd, ipo_map, sec_codes)
+            if mr is not None:
+                mkt_buf.append(mr)
+                ok += 1
+            if len(sd):
+                sec_buf.append(sd)
+        except Exception as e:  # noqa
+            fail += 1
+            if fail <= 3:
+                log.append(f"  {d.date()}: {e}")
+            if "每天" in str(e) or "每小时" in str(e):
+                break
+        if len(mkt_buf) >= flush_every or i == len(todo):
+            if mkt_buf:
+                fetchers.append_ds("market_avg", pd.DataFrame(mkt_buf))
+                mkt_buf = []
+            if sec_buf:
+                fetchers.append_ds("sector_px", pd.concat(sec_buf, ignore_index=True))
+                sec_buf = []
+        if progress:
+            progress(i / len(todo), f"全A平均股价 {d.date()} ({i}/{len(todo)})")
+    log.append(f"  完成：新增 {ok} 天，失败 {fail} 天")
+    return log
+
+
+def update_sector_px_only(start_date=None, progress=None) -> list:
+    """仅补齐配置板块成分股的历史 close/pre_close（按股票逐只拉，约45次调用），方便快速查看防御板块历史曲线。"""
+    import fetchers
+    start_date = start_date or config.PX_START
+    codes = sorted(_sector_codes())
+    old = fetchers.read_ds("sector_px")
+    latest_map = old.groupby("code")["date"].max().to_dict() if len(old) else {}
+    end_d = dt.date.today()
+    parts, ok = [], 0
+    for i, c in enumerate(codes, 1):
+        st_ = start_date
+        if c in latest_map:
+            st_ = (latest_map[c] - pd.Timedelta(days=7)).strftime("%Y%m%d")
+        try:
+            df = _windowed("daily", st_, end_d, ts_code=ts_code(c, "stock"))
+            if len(df):
+                sub = pd.DataFrame({
+                    "date": pd.to_datetime(df["trade_date"]),
+                    "code": c,
+                    "close": pd.to_numeric(df["close"], errors="coerce"),
+                    "pre_close": pd.to_numeric(df["pre_close"], errors="coerce"),
+                }).dropna()
+                parts.append(sub[sub["date"] >= pd.Timestamp(start_date)])
+                ok += 1
+        except Exception:  # noqa
+            pass
+        if progress:
+            progress(i / len(codes), f"板块复权日线 {c} ({i}/{len(codes)})")
+    n = fetchers.append_ds("sector_px", pd.concat(parts, ignore_index=True)) if parts else 0
+    return [f"【板块复权日线】更新 {ok}/{len(codes)} 只成分股，写入 {n} 行"]
 
 
 # ───────────── 接口自检 ─────────────
