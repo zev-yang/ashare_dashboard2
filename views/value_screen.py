@@ -24,14 +24,17 @@ st.caption("必需：daily_basic、财务指标、行业分类。现金流 / 分
            "全部增量更新、断点续传——中途关掉或点了别的按钮，再点一次会接着下。")
 
 
-def _run_update(label, fn):
+def _run_update(label, step_or_fn):
     bar = st.progress(0.0, text=f"{label}：准备中…")
 
     def cb(frac, text):
         bar.progress(min(max(float(frac), 0.0), 1.0), text=text)
 
     try:
-        logs = fn(cb)
+        if isinstance(step_or_fn, str):
+            logs = vd.run_update_in_subprocess(step_or_fn, cb)
+        else:
+            logs = step_or_fn(cb)
     except Exception as e:  # noqa
         logs = [f"【{label}】失败：{e!r}"]
     bar.empty()
@@ -40,13 +43,13 @@ def _run_update(label, fn):
 
 
 if st.button("🔄 更新全部数据（增量）", type="primary", disabled=not has_token, key="vs_update_all"):
-    _run_update("全部数据", vd.update_all)
+    _run_update("全部数据", "all")
 
 with st.expander("单独更新某类数据"):
     cols = st.columns(3)
-    for i, (label, fn) in enumerate(vd.STEPS):
+    for i, (label, _fn) in enumerate(vd.STEPS):
         if cols[i % 3].button(label, key=f"vs_upd_{i}", disabled=not has_token):
-            _run_update(label, fn)
+            _run_update(label, str(i))
     st.caption("首次下载较久（daily_basic 约 1500 次调用、分红约 1200 次调用）；之后每天只补新的交易日。"
                "调用太慢/太快可设环境变量 VS_CALLS_PER_MIN（默认 100，遇到频控会自动降速）。")
 

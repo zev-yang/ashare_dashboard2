@@ -85,6 +85,11 @@ if b[2].button("⑥ 本地个股日线批量更新（Tushare）", width="stretch
     run_job("⑥ 本地个股日线", lambda p: fetchers.download_local_stocks(p))
 if st.button("指数成分股名单（融资买入占比需要）"):
     run_job("指数成分股", lambda p: fetchers.update_index_cons())
+d_cols = st.columns(2)
+if d_cols[0].button("⑦ 全A平均股价（增量补齐最新）", width="stretch"):
+    run_job("⑦ 全A平均股价", lambda p: fetchers.download_market_avg(int(backfill), full_history=False, progress=p))
+if d_cols[1].button("⑦ 全A平均股价（历史回补至 2019）", width="stretch"):
+    run_job("⑦ 全A平均股价历史回补", lambda p: fetchers.download_market_avg(full_history=True, progress=p))
 
 # ───────────── 4. 自动更新 ─────────────
 st.subheader("4. 自动更新（每个交易日）")
