@@ -78,7 +78,7 @@ b = st.columns(3)
 if b[0].button("④ ETF + 板块个股日线 + ETF份额", width="stretch"):
     run_job("④ ETF/个股", lambda p: fetchers.download_prices("④", inc_sector, inc_cons, progress=p)
             + fetchers.incremental_update("etf_shares", int(backfill)))
-if b[1].button("⑤ 外资代理（A50/USDCNH/AH溢价…）", width="stretch"):
+if b[1].button("⑤ 外资代理（A50/USDCNH/AH溢价/美债中债10Y）", width="stretch"):
     run_job("⑤ 外资代理", lambda p: fetchers.download_proxies(p))
 if b[2].button("⑥ 本地个股日线批量更新（Tushare）", width="stretch",
                help="按交易日一次取全市场，把你日线目录里每只股票补到最新（追加）"):

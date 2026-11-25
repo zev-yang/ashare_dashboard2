@@ -2,6 +2,7 @@
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 import analytics as an
@@ -9,7 +10,7 @@ import config
 import fetchers
 import loaders
 from common import (ETF_ALL, IDX, IDX_CODES, NAME, SEC_CODES, amount_panel, close_panel, ds, num, pct,
-                    render_freshness, show, stamp)
+                    render_freshness, run_job, show, stamp)
 
 st.title("A股短期趋势监控")
 if config.DEMO:
@@ -20,7 +21,7 @@ render_freshness()
 S = stamp()
 
 # ───────────── 指数日线 & as-of ─────────────
-idx_close = close_panel(tuple(IDX_CODES), S)
+idx_close = close_panel(tuple(IDX_CODES), S, tail=None)
 BENCH_CODE = IDX[config.BENCH]["code"]
 if idx_close.empty or BENCH_CODE not in idx_close.columns:
     st.error(f"没有读到基准指数 {config.BENCH}（{BENCH_CODE}）的日线，程序无法继续。下表说明每个指数文件的情况：")
@@ -42,7 +43,7 @@ asof = dates[dates <= pd.Timestamp(asof)][-1]
 st.caption(f"统计截止：{asof.date()}  ｜  红涨绿跌  ｜  本周=周一起至今，本月=月初起至今（以上一周期最后交易日收盘为基准）")
 
 # ───────────── 预计算：各模块 ─────────────
-sec_close = close_panel(tuple(SEC_CODES), S)
+sec_close = close_panel(tuple(SEC_CODES), S, tail=None, adjust="qfq")
 etf_close = close_panel(tuple(ETF_ALL), S)
 etf_amount = amount_panel(tuple(ETF_ALL), S)
 
@@ -106,7 +107,7 @@ for nm, info in IDX.items():
     fut[nm] = dict(tot=tot, etf_f=etf_f, dbal=dbal, cls=cls,
                    basis=an.basis_series(fdaily, cls, v) if len(fdaily) else pd.DataFrame())
 
-tabs = st.tabs(["总览", "① 避险板块", "② ETF资金", "③ 期指持仓", "④ 融资融券", "⑤ 均线", "说明与限制"])
+tabs = st.tabs(["总览", "① 避险板块", "② ETF资金", "③ 期指持仓", "④ 融资融券", "⑤ 均线", "⑥ 跨境资金", "说明与限制"])
 
 # ═════════ 总览 ═════════
 with tabs[0]:
@@ -211,26 +212,58 @@ with tabs[1]:
     ref_rows = []
     for nm, c in config.REF_ETFS.items():
         if loaders.has_local(c):
-            p = loaders.load_price(c)["close"]
+            p = loaders.load_price(c, adjust="qfq")["close"]
             r = an.period_returns(p, asof)
             ref_rows.append({"参考ETF": nm, "代码": c, "当日": r["day"], "本周": r["wtd"], "本月": r["mtd"]})
     if ref_rows:
-        st.markdown("**参考 ETF**")
+        st.markdown("**参考 ETF（前复权）**")
         show(pd.DataFrame(ref_rows), pct_cols=["当日", "本周", "本月"], color_cols=["当日", "本周", "本月"])
     if len(sec_close):
-        n = st.slider("走势窗口(日)", 20, 250, 60, key="sec_n")
+        win_opts = {"近60日": 60, "近120日": 120, "近1年(250日)": 250, "近3年(750日)": 750,
+                    "近5年(1250日)": 1250, "近10年(2500日)": 2500, "全部历史": 0}
+        win_label = st.radio("走势窗口", list(win_opts.keys()), index=0, horizontal=True, key="sec_win")
+        n = win_opts[win_label]
+
+        b_all = bench_close[bench_close.index <= asof].dropna()
+        sec_all = sec_close[sec_close.index <= asof]
+        if len(b_all):
+            start_dt = b_all.index[-n] if (n > 0 and len(b_all) >= n) else b_all.index[0]
+        else:
+            start_dt = sec_all.index[-n] if (n > 0 and len(sec_all) >= n) else sec_all.index[0]
+
         fig = go.Figure()
-        b = bench_close[bench_close.index <= asof].tail(n)
-        fig.add_scatter(x=b.index, y=b / b.iloc[0], name="沪深300", line=dict(color="#555", dash="dash"))
-        cur = an.basket_curve(sec_close[sec_close.index <= asof].tail(n), def_codes)
+        b = b_all[b_all.index >= start_dt]
+        if len(b):
+            fig.add_scatter(x=b.index, y=b / b.iloc[0], name="沪深300", line=dict(color="#555", dash="dash"))
+
+        sec_win_df = sec_all[sec_all.index >= start_dt]
+        def_sub = sec_win_df[[c for c in def_codes if c in sec_win_df.columns]].dropna(how="all")
+        cur = an.basket_curve(def_sub, def_codes)
         if len(cur):
-            fig.add_scatter(x=cur.index, y=cur / cur.iloc[0], name="防御综合", line=dict(width=3))
+            fig.add_scatter(x=cur.index, y=cur / cur.iloc[0], name="防御综合(前复权)", line=dict(width=3))
         for nm, info in config.SECTORS.items():
-            cv = an.basket_curve(sec_close[sec_close.index <= asof].tail(n), [c for c, _ in info["stocks"]])
-            if len(cv):
+            scols = [c for c, _ in info["stocks"] if c in sec_win_df.columns]
+            if not scols:
+                continue
+            sub_s = sec_win_df[scols].dropna(how="all")
+            cv = an.basket_curve(sub_s, scols)
+            if len(cv) >= 2:
                 fig.add_scatter(x=cv.index, y=cv / cv.iloc[0], name=nm, visible="legendonly")
-        fig.update_layout(height=420, margin=dict(t=20), yaxis_title="期初=1")
+        fig.update_layout(height=420, margin=dict(t=20), yaxis_title="期初=1（前复权等权）", hovermode="x unified")
         st.plotly_chart(fig, width="stretch")
+
+        with st.expander("长历史回补（4大指数 + 避险板块前复权因子，扩展超过2019年的曲线）"):
+            b_span = f"{b_all.index.min().date()} ~ {b_all.index.max().date()}（{len(b_all)} 日）" if len(b_all) else "无"
+            s_valid = sec_all.dropna(how="all")
+            s_span = f"{s_valid.index.min().date()} ~ {s_valid.index.max().date()}（{len(s_valid)} 日）" if len(s_valid) else "无"
+            st.caption(f"沪深300：{b_span}　｜　避险板块：{s_span}")
+            hc1, hc2 = st.columns(2)
+            if hc1.button("📥 回补至 2005-01-01（对齐沪深300，约1-2分钟）", width="stretch"):
+                run_job("回补指数与板块至2005", lambda p: fetchers.backfill_sector_and_index("20050101", p))
+            if hc2.button("📥 回补至 2000-01-01（板块更早历史，约2分钟）", width="stretch"):
+                run_job("回补指数与板块至2000", lambda p: fetchers.backfill_sector_and_index("20000101", p))
+            if "last_log" in st.session_state and str(st.session_state["last_log"][0]).startswith("回补指数与板块"):
+                st.text("\n".join(st.session_state["last_log"][1]))
         for nm, info in config.SECTORS.items():
             codes = [c for c, _ in info["stocks"] if c in sec_close.columns]
             if codes:
@@ -401,8 +434,144 @@ with tabs[5]:
         fig.update_layout(height=320, margin=dict(t=30, b=10), title=nm)
         cols[i % 2].plotly_chart(fig, width="stretch")
 
-# ═════════ 说明 ═════════
+# ═════════ ⑥ 跨境资金 ═════════
 with tabs[6]:
+    st.subheader("维度 1：跨境资金与宏观利率（领先 / 共振风格判断）")
+    proxy_df = ds("proxy_daily", S)
+    def_all_df = sec_close[sec_close.index <= asof][[c for c in def_codes if c in sec_close.columns]].dropna(how="all") if len(sec_close) else pd.DataFrame()
+    def_curve_all = an.basket_curve(def_all_df, def_codes) if len(def_all_df) else pd.Series(dtype=float)
+
+    have_syms = sorted(set(proxy_df["symbol"])) if len(proxy_df) else []
+    need_rates = [s for s in ("US10Y", "CN10Y") if s not in have_syms]
+    with st.container(border=True):
+        u1, u2 = st.columns([3, 1.3])
+        u1.caption(
+            f"当前缓存序列（{len(have_syms)} 个）：{', '.join(have_syms) if have_syms else '无'}"
+            + (f"　｜　⚠️ 缺少利率数据 {', '.join(need_rates)}，请点击右侧按钮更新" if need_rates else "")
+        )
+        if u2.button("🔄 更新外资代理与利率 (⑤)", width="stretch", key="cb_upd_btn"):
+            run_job("⑤ 外资代理与利率", lambda p: fetchers.download_proxies(p))
+
+    cb_res = an.cross_border_analysis(proxy_df, bench_close, def_curve_all, asof) if len(proxy_df) else {}
+    if not cb_res:
+        st.info("还没有外资代理与利率数据，请点击上方「🔄 更新外资代理与利率 (⑤)」。")
+    else:
+        panel = cb_res["panel"]
+        meta = cb_res["meta"].copy()
+        last = panel.iloc[-1]
+
+        # 预警提示
+        rel_p = last["rel_pct120"]
+        if int(last["conv_streak"]) >= 5:
+            st.success(f"🔔 **强反转预警**：跨境维度已连续 **{int(last['conv_streak'])}** 个交易日判定「背离收敛」，关注风格向沪深300/宽基切换。")
+        elif pd.notna(rel_p) and rel_p >= 0.85 and pd.notna(last["imp_score"]) and last["imp_score"] <= -0.4:
+            st.warning(f"🔔 **高拥挤 + 短线转收敛预警**：防御/沪深300 处于近120日 **{rel_p:.0%}** 高分位，且5日边际动向已转向宽基，注意均值回归风险。")
+        elif pd.notna(rel_p) and rel_p >= 0.85 and last["verdict"] == "背离延续":
+            st.warning(f"⚠️ **高拥挤度提示**：虽然宏观仍在「背离延续」，但防御/沪深300 已处于近120日 **{rel_p:.0%}** 高分位，不宜盲目追高防御。")
+
+        # 与 ② ETF / ④ 融资 的交叉验证提示
+        etf_300 = etf_res.get(config.BENCH) if etf_res else None
+        mg_300 = mg_sum.get(config.BENCH) if mg_sum else None
+        if etf_300 or mg_300:
+            etf_txt = f"沪深300 ETF 近5日净申购 {num(etf_300['d5'])} 亿" if etf_300 else ""
+            mg_txt = f"沪深300 融资买入占比分位 {pct(mg_300.get('pct'))}" if mg_300 else ""
+            st.caption("跨维度在岸验证参考：" + "　｜　".join(x for x in (etf_txt, mg_txt) if x))
+
+        # 顶栏指标卡
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("维度判定", str(last["verdict"]), f"有效指标 {int(last['n_avail'])}/5")
+        c2.metric("投票 (延续 / 中性 / 收敛)",
+                  f"{int(last['n_cont'])} / {int(last['n_avail'] - last['n_cont'] - last['n_conv'])} / {int(last['n_conv'])}",
+                  f"净得分 {last['net_score']:+.2f}" if pd.notna(last["net_score"]) else None)
+        c3.metric("防御/沪深300 120日分位", pct(rel_p, 0), f"比值 {num(last['rel_ratio'], 3)}")
+        c4.metric("中美 10Y 利差 (中-美)", num(last["spread_cn_us"], 2, "%") if pd.notna(last["spread_cn_us"]) else "—")
+        c5.metric("5日短期冲量均值", f"{last['imp_score']:+.2f}" if pd.notna(last["imp_score"]) else "—")
+
+        # 5 指标明细表
+        vote_txt = {1.0: "🔴 背离延续(偏防御)", -1.0: "🟢 背离收敛(偏宽基)", 0.0: "⚪ 中性"}
+        imp_txt = {1.0: "偏延续(+1)", -1.0: "偏收敛(-1)", 0.0: "中性(0)"}
+        disp = pd.DataFrame({
+            "指标": meta["指标"],
+            "最新值": [num(v, 3 if not r else 2, "%" if r else "") for v, r in zip(meta["最新值"], meta["is_rate"])],
+            "MA5": [num(v, 3 if not r else 2) for v, r in zip(meta["MA5"], meta["is_rate"])],
+            "MA20": [num(v, 3 if not r else 2) for v, r in zip(meta["MA20"], meta["is_rate"])],
+            "MA20近5日斜率": [pct(v, 2) if not r else (num(v * 100, 1, " bps") if pd.notna(v) else "—")
+                              for v, r in zip(meta["MA20近5日变化"], meta["is_rate"])],
+            "短期5日动向": [imp_txt.get(x, "数据不足") for x in meta["短期5日动向"]],
+            "趋势投票": [vote_txt.get(x, "数据不足") for x in meta["趋势投票"]],
+            "时区对齐": meta["时区对齐"],
+        })
+        st.dataframe(disp, hide_index=True, width="stretch")
+
+        # 双轴叠加图
+        win_cb = st.radio("叠加走势窗口", ["近120日", "近1年(250日)", "近3年(750日)", "全部历史"],
+                          index=1, horizontal=True, key="cb_win")
+        wn = {"近120日": 120, "近1年(250日)": 250, "近3年(750日)": 750, "全部历史": 0}[win_cb]
+        p_sub = panel.tail(wn) if wn > 0 else panel
+        p_sub = p_sub[p_sub["n_avail"] >= 3]
+
+        if len(p_sub) >= 2:
+            fig = make_subplots(specs=[[{"secondary_y": True}]])
+            if p_sub["rel_ratio"].notna().any():
+                fig.add_trace(
+                    go.Scatter(x=p_sub.index, y=p_sub["rel_ratio"], name="防御综合 ÷ 沪深300（左轴，上升=防御走强）",
+                               line=dict(color="#d62728", width=2.3)),
+                    secondary_y=False,
+                )
+            fig.add_trace(
+                go.Scatter(x=p_sub.index, y=p_sub["net_score_ma5"], name="跨境净得分5日均（右轴，>0偏延续/<0偏收敛）",
+                           line=dict(color="#1f77b4", width=1.8)),
+                secondary_y=True,
+            )
+            fig.add_hline(y=0, line_dash="dot", line_color="#888", secondary_y=True)
+            fig.update_yaxes(title_text="防御 ÷ 沪深300 相对比值", secondary_y=False)
+            fig.update_yaxes(title_text="跨境综合净得分 [-1, +1]", range=[-1.15, 1.15], secondary_y=True)
+            fig.update_layout(height=420, margin=dict(t=30, b=20), hovermode="x unified",
+                              legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
+            st.plotly_chart(fig, width="stretch")
+
+        with st.expander("各单项指标走势与中美 10Y 利差"):
+            s_df = cb_res["series"].loc[p_sub.index] if len(p_sub) else cb_res["series"]
+            cA, cB = st.columns(2)
+            for idx_i, (col_k, title_t) in enumerate([
+                ("kweb_a50", "KWEB ÷ A50（下降=成长跑输防御）"),
+                ("hsahp", "恒生AH股溢价 HSAHP（上升=外资/港股情绪折价）"),
+                ("usdcnh", "外汇锚 USDCNH/中间价（上升=人民币贬值）"),
+                ("spread", "10Y 美债 vs 中债收益率 (%)"),
+            ]):
+                f_sub = go.Figure()
+                if col_k == "spread":
+                    if s_df["us10y"].notna().any():
+                        f_sub.add_scatter(x=s_df.index, y=s_df["us10y"], name="美债10Y")
+                    if s_df["cn10y"].notna().any():
+                        f_sub.add_scatter(x=s_df.index, y=s_df["cn10y"], name="中债10Y")
+                    if p_sub["spread_cn_us"].notna().any():
+                        f_sub.add_scatter(x=p_sub.index, y=p_sub["spread_cn_us"], name="中-美利差", line=dict(dash="dot"))
+                else:
+                    k_map = {"usdcnh": "fx"}.get(col_k, col_k)
+                    sr = s_df[k_map].dropna()
+                    if len(sr):
+                        f_sub.add_scatter(x=sr.index, y=sr, name=k_map)
+                        f_sub.add_scatter(x=sr.index, y=sr.rolling(20).mean(), name="MA20", line=dict(dash="dash"))
+                f_sub.update_layout(height=280, margin=dict(t=30, b=10), title=title_t)
+                (cA if idx_i % 2 == 0 else cB).plotly_chart(f_sub, width="stretch")
+
+        # 历史回测检验（基线对照）
+        st.markdown("#### 历史传导检验（对比「全样本无条件基线」，检查是否真有领先区分度）")
+        val = an.cross_border_validation(cb_res, horizons=(5, 10))
+        if len(val):
+            show(
+                val,
+                pct_cols=["占比", "后5日相对超额均值", "后10日相对超额均值", "后5日防御跑赢占比", "按方向命中率(5日)"],
+                color_cols=["后5日相对超额均值", "后10日相对超额均值"],
+            )
+            st.caption("阅读方法：若「背离延续」的后5日/10日相对超额显著高于「全样本基准」，且「背离收敛」显著低于基准（甚至转负），"
+                       "才说明该维度在统计上具备有效区分度。美股/美债/NY外汇均已做 +1 自然日对齐，回测无未来函数。")
+        else:
+            st.info("有效历史重叠交易日不足 30 天，尚无法做历史检验（请先更新代理数据并确保防御板块与沪深300日线对齐）。")
+
+# ═════════ 说明 ═════════
+with tabs[7]:
     st.markdown("""
 **数据来源与可得性**
 - 本地日线：指数、ETF、个股（你自己下载）。ETF 日线需含成交额。
