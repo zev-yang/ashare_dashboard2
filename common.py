@@ -58,13 +58,13 @@ def stamp():
 
 
 @st.cache_data(show_spinner=False)
-def close_panel(codes, stamp_key):
-    return loaders.load_panel(list(codes), "close", tail=500)
+def close_panel(codes, stamp_key, tail=500, adjust=None):
+    return loaders.load_panel(list(codes), "close", tail=tail, adjust=adjust)
 
 
 @st.cache_data(show_spinner=False)
-def amount_panel(codes, stamp_key):
-    return loaders.load_panel(list(codes), "amount", tail=500)
+def amount_panel(codes, stamp_key, tail=500):
+    return loaders.load_panel(list(codes), "amount", tail=tail)
 
 
 @st.cache_data(show_spinner=False)

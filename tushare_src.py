@@ -226,6 +226,18 @@ def index_global_hist(ts: str) -> pd.DataFrame:
     return pd.DataFrame({"date": pd.to_datetime(df["trade_date"]), "open": df["open"], "high": df["high"],
                          "low": df["low"], "close": df["close"], "volume": df.get("vol")})
 
+def us_tycr_hist() -> pd.DataFrame:
+    """Tushare 美债收益率曲线（取 10 年期 y10）。"""
+    df = _windowed("us_tycr", config.PX_START, dt.date.today(), fields="date,y10")
+    if df.empty or "y10" not in df.columns:
+        raise ValueError("Tushare us_tycr 为空（无权限或无数据）")
+    out = pd.DataFrame({
+        "date": pd.to_datetime(df["date"].astype(str), errors="coerce"),
+        "close": pd.to_numeric(df["y10"], errors="coerce"),
+    }).dropna()
+    return out.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+
+
 
 # ───────────── 本地个股日线批量更新（追加到你的日线目录）─────────────
 def _parse_ymd(raw):
@@ -320,21 +332,32 @@ def update_local_stock_daily(progress=None, history_start=None, chunk_days=15) -
     import loaders
     history_start = history_start or config.PX_START
     latest = latest_ready_date()
-    basic = call("stock_basic", exchange="", list_status="L", fields="ts_code,symbol,name")
+    import bisect
+
+    basic = call("stock_basic", exchange="", list_status="L", fields="ts_code,symbol,name,list_date")
     names = dict(zip(basic["symbol"], basic["name"]))
     todo, fresh = {}, 0
     index_codes = {v["code"] for v in config.INDEXES.values()}
     skipped_idx = []
-    for code in basic["symbol"]:
+    for code, list_d in zip(basic["symbol"], basic["list_date"]):
         if code in index_codes:                     # 000016/000905/000852 既是指数又是个股：绝不往可能是指数的文件里追加
             skipped_idx.append(code)
             continue
         p = _local_path(code)
         ld = _last_date(p) if p.exists() else None
         if ld is None:
-            todo[code] = history_start
+            ld_est = _parse_ymd(list_d)
+            s_dt = max(history_start, ld_est) if ld_est else history_start
+            if s_dt <= latest:
+                todo[code] = s_dt
+            else:
+                fresh += 1
         elif ld < latest:
-            todo[code] = (dt.datetime.strptime(ld, "%Y%m%d") + dt.timedelta(days=1)).strftime("%Y%m%d")
+            s_dt = (dt.datetime.strptime(ld, "%Y%m%d") + dt.timedelta(days=1)).strftime("%Y%m%d")
+            if s_dt <= latest:
+                todo[code] = s_dt
+            else:
+                fresh += 1
         else:
             fresh += 1
     log = [f"【⑥ 本地个股日线】目录 {config.DAILY_DIR}；最新入库日 {latest}；已是最新 {fresh} 只，需补 {len(todo)} 只"]
@@ -342,58 +365,91 @@ def update_local_stock_daily(progress=None, history_start=None, chunk_days=15) -
         log.append(f"  已跳过与指数同号的个股 {skipped_idx}（其本地文件可能是指数数据，不追加）")
     if not todo:
         return log
-    days = trade_dates(min(todo.values()), latest)
-    written, bad, discont = 0, 0, []
-    if len(days) <= len(todo):
-        log.append(f"  方式：按日批量（{len(days)} 次调用，替代逐只 {len(todo)} 次）")
-        for i in range(0, len(days), chunk_days):
-            frames, day_frames = [], []
-            for d in days[i:i + chunk_days]:
-                df = call("daily", trade_date=_ymd(d))
-                if len(df):
-                    frames.append(df)
-                    day_frames.append((_ymd(d), df))
-                if progress:
-                    progress(min((days.index(d) + 1) / len(days), 1.0), f"本地日线 {d.date()}")
-            if day_frames:
-                record_avg_from_daily(day_frames)
-            if not frames:
-                continue
-            big = _to_std(pd.concat(frames, ignore_index=True), names)
-            for code, g in big.groupby("code"):
-                if code not in todo:
-                    continue
-                g = g[g["date"].str.replace("-", "") >= todo[code]]
-                if g.empty:
-                    continue
-                path = _local_path(code)
-                if path.exists() and not _continuous(path, g):
-                    discont.append(code)
-                    continue
-                if _append_rows(path, g):
-                    written += 1
-                else:
-                    bad += 1
+
+    all_cal = trade_dates(min(todo.values()), latest)
+    cal_ymds = [_ymd(d) for d in all_cal]
+    first_idx = {code: bisect.bisect_left(cal_ymds, s) for code, s in todo.items()}
+    # 过滤掉起点之后已经没有交易日的股票（如周末日期后无交易日）
+    todo = {code: s for code, s in todo.items() if first_idx[code] < len(all_cal)}
+    if not todo:
+        return log
+
+    # 寻找使 (按日批量天数 + 逐只离群股数) 最小的切分点
+    sorted_idx = sorted(first_idx[c] for c in todo)
+    best_split, best_cost = None, len(todo)
+    for idx in range(len(all_cal)):
+        n_days = len(all_cal) - idx
+        n_indiv = bisect.bisect_left(sorted_idx, idx)
+        if n_days + n_indiv < best_cost:
+            best_cost = n_days + n_indiv
+            best_split = idx
+
+    if best_split is None:
+        bulk_days = []
+        bulk_todo = {}
+        indiv_todo = dict(todo)
+        log.append(f"  方式：逐只（{len(indiv_todo)} 次调用，比按日批量更省）")
     else:
-        log.append(f"  方式：逐只（{len(todo)} 次调用，比按日批量 {len(days)} 次更少）")
-        for i, (code, start) in enumerate(todo.items()):
-            try:
-                df = call("daily", ts_code=ts_code(code, "stock"), start_date=start, end_date=latest)
-            except Exception as e:  # noqa
-                log.append(f"  {code}: {e}")
-                continue
+        bulk_days = all_cal[best_split:]
+        bulk_todo = {c: s for c, s in todo.items() if first_idx[c] >= best_split}
+        indiv_todo = {c: s for c, s in todo.items() if first_idx[c] < best_split}
+        log.append(f"  方式：按日批量 {len(bulk_days)} 天（{len(bulk_todo)} 只）+ 逐只补齐离群股 {len(indiv_todo)} 只（共约 {best_cost} 次调用）")
+
+    written, bad, discont = 0, 0, []
+    total_ops = max(len(bulk_days) + len(indiv_todo), 1)
+    done_ops = 0
+
+    for i in range(0, len(bulk_days), chunk_days):
+        frames, day_frames = [], []
+        for d in bulk_days[i:i + chunk_days]:
+            df = call("daily", trade_date=_ymd(d))
             if len(df):
-                g = _to_std(df, names)
-                path = _local_path(code)
-                if path.exists() and not _continuous(path, g):
-                    discont.append(code)
-                    continue
-                if _append_rows(path, g):
-                    written += 1
-                else:
-                    bad += 1
+                frames.append(df)
+                day_frames.append((_ymd(d), df))
+            done_ops += 1
             if progress:
-                progress((i + 1) / len(todo), f"本地日线 {code}")
+                progress(min(done_ops / total_ops, 1.0), f"本地日线 {d.date()}")
+        if day_frames:
+            record_avg_from_daily(day_frames)
+        if not frames:
+            continue
+        big = _to_std(pd.concat(frames, ignore_index=True), names)
+        for code, g in big.groupby("code"):
+            if code not in bulk_todo:
+                continue
+            g = g[g["date"].str.replace("-", "") >= bulk_todo[code]]
+            if g.empty:
+                continue
+            path = _local_path(code)
+            if path.exists() and not _continuous(path, g):
+                discont.append(code)
+                continue
+            if _append_rows(path, g):
+                written += 1
+            else:
+                bad += 1
+
+    for code, start in indiv_todo.items():
+        try:
+            df = _windowed("daily", start, latest, ts_code=ts_code(code, "stock"))
+        except Exception as e:  # noqa
+            log.append(f"  {code}: {e}")
+            done_ops += 1
+            if progress:
+                progress(min(done_ops / total_ops, 1.0), f"离群个股 {code}")
+            continue
+        if len(df):
+            g = _to_std(df, names)
+            path = _local_path(code)
+            if path.exists() and not _continuous(path, g):
+                discont.append(code)
+            elif _append_rows(path, g):
+                written += 1
+            else:
+                bad += 1
+        done_ops += 1
+        if progress:
+            progress(min(done_ops / total_ops, 1.0), f"离群个股 {code}")
     loaders.rescan()
     log.append(f"  完成：写入/追加 {written} 只" + (f"；{bad} 只文件表头不是标准格式，已跳过" if bad else ""))
     if discont:

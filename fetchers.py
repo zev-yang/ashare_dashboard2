@@ -601,13 +601,19 @@ def _fetch_price_raw(code: str, kind: str, start: str):
             raise RuntimeError(f"东财失败({e1})；新浪也失败({e2})")
 
 
-def download_price(code: str, kind: str) -> str:
-    """增量下载单个代码，合并写入 cache/px/{code}.csv（成交额为"元"口径）。返回一行日志。"""
+def download_price(code: str, kind: str, start_date: str = None) -> str:
+    """增量下载单个代码，合并写入 cache/px/{code}.csv（成交额为"元"口径）。指定 start_date 时可向更早历史回补。"""
     px = config.CACHE_DIR / "px"
     px.mkdir(exist_ok=True)
     f = px / (f"index_{code}.csv" if kind == "index" else f"{code}.csv")      # 指数与个股同号时不会互相覆盖
     old = pd.read_csv(f, parse_dates=["date"]) if f.exists() else None
-    start = config.PX_START if old is None or old.empty else (old["date"].max() - pd.Timedelta(days=7)).strftime("%Y%m%d")
+    base_start = start_date or config.PX_START
+    if old is None or old.empty:
+        start = base_start
+    elif start_date is not None and old["date"].min() > pd.Timestamp(start_date) + pd.Timedelta(days=20):
+        start = start_date
+    else:
+        start = (old["date"].max() - pd.Timedelta(days=7)).strftime("%Y%m%d")
     new, src, errs = None, "", []
     for s_ in _sources():
         try:
@@ -625,7 +631,7 @@ def download_price(code: str, kind: str) -> str:
     if src == "新浪" and new["amount"].isna().all():            # 新浪源没有成交额：用 收盘价×成交量 近似
         new["amount"] = new["close"] * new["volume"]
         note = "（新浪源，成交额=收盘价×成交量 近似）"
-    new = new[new["date"] >= pd.Timestamp(config.PX_START)]
+    new = new[new["date"] >= pd.Timestamp(base_start)]
     allx = pd.concat([old, new], ignore_index=True) if old is not None else new
     allx = allx.sort_values("date").drop_duplicates("date", keep="last")
     allx.to_csv(f, index=False)
@@ -659,10 +665,115 @@ def download_prices(group_prefix: str, include_sector=True, include_cons=False, 
     return log
 
 
-# ───────────── ⑤ 外资代理指标 ─────────────
+def update_sector_adj(progress=None) -> list:
+    """增量更新 SECTORS 成分股复权因子（近期缺日按交易日一次全市场取，每天仅1次调用）。"""
+    if not tsrc.available() or getattr(config, "SOURCE", "auto") == "free":
+        return []
+    import loaders
+
+    sec_codes = sorted({c for s in config.SECTORS.values() for c, _ in s["stocks"]})
+    try:
+        latest = tsrc.latest_ready_date()
+    except Exception as e:  # noqa
+        return [f"【板块复权因子】探测最新交易日失败：{explain(e)}"]
+
+    latest_ts = pd.Timestamp(latest)
+    lagging_recent, lagging_long = [], []
+    for c in sec_codes:
+        af = loaders.read_adj_factor(c)
+        if af is None or af.empty:
+            lagging_long.append(c)
+        elif af.index.max() < latest_ts:
+            if (latest_ts - af.index.max()).days <= 25:
+                lagging_recent.append((c, af.index.max()))
+            else:
+                lagging_long.append(c)
+
+    ok_days = ok_stocks = 0
+    if lagging_recent:
+        min_have = min(d for _, d in lagging_recent)
+        days = tsrc.trade_dates(min_have + pd.Timedelta(days=1), latest_ts)
+        need_set = {tsrc.ts_code(c, "stock"): c for c, _ in lagging_recent}
+        for i, d in enumerate(days, 1):
+            try:
+                df = tsrc.call("adj_factor", trade_date=d.strftime("%Y%m%d"))
+                if len(df):
+                    sub = df[df["ts_code"].isin(need_set)]
+                    for tsc, g in sub.groupby("ts_code"):
+                        loaders.save_adj_factor(need_set[tsc], g)
+                    ok_days += 1
+            except Exception:  # noqa
+                pass
+            if progress:
+                progress(i / max(len(days), 1), f"复权因子 {d.date()}")
+
+    for i, c in enumerate(lagging_long, 1):
+        px = loaders.load_price(c, kind="stock")
+        st_ = px.index.min() if px is not None and len(px) else pd.Timestamp(config.PX_START)
+        af = loaders.get_adj_factor(c, st_, latest_ts, kind="stock", fetch_missing=True)
+        if af is not None and len(af):
+            ok_stocks += 1
+        if progress:
+            progress(i / max(len(lagging_long), 1), f"复权因子 {c}")
+
+    if not lagging_recent and not lagging_long:
+        return ["【板块复权因子】已是最新"]
+    return [f"【板块复权因子】按日补 {ok_days} 天（{len(lagging_recent)} 只），逐只补 {ok_stocks}/{len(lagging_long)} 只"]
+
+
+def backfill_sector_and_index(start_date: str = "20050101", progress=None) -> list:
+    """回补 4大指数 + SECTORS 成分股 + REF_ETFS 历史日线至 start_date，并同步拉齐复权因子。"""
+    import loaders
+
+    idx_items = [(v["code"], "index") for v in config.INDEXES.values()]
+    sec_items = [(c, "stock") for c in sorted({c for s in config.SECTORS.values() for c, _ in s["stocks"]})]
+    etf_items = [(c, "etf") for c in sorted(set(config.REF_ETFS.values()))]
+    items = idx_items + sec_items + etf_items
+
+    log = [f"【长历史回补】起始日 {start_date}，共 {len(items)} 个标的（4指数 + {len(sec_items)}板块股 + {len(etf_items)}参考ETF）"]
+    total = len(items)
+    for i, (code, kind) in enumerate(items):
+        if i:
+            time.sleep(getattr(config, "PX_SLEEP", 0.3) + random.random() * 0.2)
+        px = loaders.load_price(code, kind=kind)
+        need_px = (px is None or px.empty or px.index.min() > pd.Timestamp(start_date) + pd.Timedelta(days=20))
+        if need_px:
+            log.append(download_price(code, kind, start_date=start_date))
+        else:
+            log.append(f"  {code}({kind}): 本地已涵盖至 {px.index.min().date()}，跳过日线回补")
+
+        if kind in ("stock", "etf") and tsrc.available():
+            px2 = loaders.load_price(code, kind=kind)
+            fdt = px2.index.min() if px2 is not None and len(px2) else pd.Timestamp(start_date)
+            ldt = px2.index.max() if px2 is not None and len(px2) else pd.Timestamp.today()
+            af = loaders.get_adj_factor(code, fdt, ldt, kind=kind, fetch_missing=True)
+            if af is not None and len(af):
+                log[-1] += f"；复权因子 {af.index.min().date()}~{af.index.max().date()}"
+            elif kind == "stock":
+                log[-1] += "；⚠ 未获取到复权因子"
+
+        if progress:
+            progress((i + 1) / total, f"回补 {code} ({i + 1}/{total})")
+
+    loaders.rescan()
+    return log
+
+# ───────────── ⑤ 外资代理指标（兼容 akshare 1.20.44+ 更名，优先 Tushare/新浪）─────────────
+def _ak_fn(ak, *names):
+    for n in names:
+        f = getattr(ak, n, None)
+        if f is not None:
+            return f
+    raise AttributeError(f"akshare {ak_version()} 缺少接口：{' / '.join(names)}")
+
+
 def _boc_mid(ak):
-    """备用：央行人民币对美元中间价（新浪-中行外汇牌价历史）。注意是在岸中间价，不是离岸即期，保存为 USDCNY_MID。"""
-    raw = ak.currency_boc_sina(symbol="美元", start_date=config.PX_START, end_date=pd.Timestamp.today().strftime("%Y%m%d"))
+    """备用：央行人民币对美元中间价（新浪-中行外汇牌价）。注意是在岸中间价，保存为 USDCNY_MID。"""
+    fn = getattr(ak, "fx_boc_rate_sina", None)
+    if fn is not None:
+        raw = fn(symbol="美元")
+    else:
+        raw = ak.currency_boc_sina(symbol="美元", start_date=config.PX_START, end_date=pd.Timestamp.today().strftime("%Y%m%d"))
     col = next((c for c in raw.columns if "中间价" in str(c)), None)
     dcol = next((c for c in raw.columns if "日期" in str(c) or str(c).lower() == "date"), None)
     if col is None or dcol is None:
@@ -673,27 +784,48 @@ def _boc_mid(ak):
     return pd.DataFrame({"date": raw[dcol], "close": close})
 
 
+def _bond_yield_em(ak, col_kw: str):
+    """东财中美国债收益率备用（限流时排在 Sina/Tushare 之后）。"""
+    fn = _ak_fn(ak, "bond_zh_us_yield_em", "bond_zh_us_rate")
+    raw = fn()
+    dcol = next((c for c in raw.columns if "日期" in str(c) or str(c).lower() == "date"), None)
+    vcol = next((c for c in raw.columns if col_kw in str(c)), None)
+    if dcol is None or vcol is None:
+        raise ParseError(f"中美国债接口返回列不符：{list(raw.columns)}")
+    return pd.DataFrame({"date": raw[dcol], "close": pd.to_numeric(raw[vcol], errors="coerce")}).dropna()
+
+
 def proxy_candidates():
     """每个指标按优先级给出多个来源：(指标, 说明, [(来源名, 取数函数, 保存时的代码[None=同指标]), ...])。
-    已按实测结果剔除不可用来源（新浪 XIN9、新浪 HSAHP）。东财接口在部分网络下断连，所以排在后面。"""
+    优先 Tushare 与新浪，避免东财 push2 高频限流。"""
     ts = "tushare" in _sources()
-    a50 = [(f"新浪 {config.A50_SYMBOL}", lambda ak: ak.futures_foreign_hist(symbol=config.A50_SYMBOL), None),
-           ("东财 国际期货", lambda ak: ak.futures_global_hist_em(symbol="富时中国A50指数当月连续"), None)]
-    usd = [("东财", lambda ak: ak.forex_hist_em(symbol="USDCNH"), None),
-           ("中行牌价·央行中间价(替代,存为USDCNY_MID)", _boc_mid, "USDCNY_MID")]
-    hsi = [("新浪", lambda ak: ak.stock_hk_index_daily_sina(symbol="HSI"), None),
-           ("东财", lambda ak: ak.stock_hk_index_daily_em(symbol="HSI"), None)]
+    a50 = [(f"新浪 {config.A50_SYMBOL}", lambda ak: _ak_fn(ak, "futures_foreign_hist_sina", "futures_foreign_hist")(symbol=config.A50_SYMBOL), None)]
+    usd = [("新浪 中行中间价(替代,存为USDCNY_MID)", _boc_mid, "USDCNY_MID"),
+           ("东财 USDCNH", lambda ak: _ak_fn(ak, "fx_hist_em", "forex_hist_em")(symbol="USDCNH"), None)]
+    hsi = [("新浪 恒指", lambda ak: _ak_fn(ak, "index_hk_daily_sina", "stock_hk_index_daily_sina")(symbol="HSI"), None),
+           ("东财 恒指", lambda ak: _ak_fn(ak, "index_hk_daily_em", "stock_hk_index_daily_em")(symbol="HSI"), None)]
+    hsahp = [("新浪 AH溢价", lambda ak: _ak_fn(ak, "index_hk_daily_sina", "stock_hk_index_daily_sina")(symbol="HSAHP"), None),
+             ("东财 AH溢价", lambda ak: _ak_fn(ak, "index_hk_daily_em", "stock_hk_index_daily_em")(symbol="HSAHP"), None)]
+    us10y = [("新浪 美国10年期国债", lambda ak: ak.bond_gb_us_sina(symbol="美国10年期国债"), None),
+             ("东财 美债10Y", lambda ak: _bond_yield_em(ak, "美国国债收益率10年"), None)]
+    cn10y = [("新浪 中国10年期国债", lambda ak: ak.bond_gb_zh_sina(symbol="中国10年期国债"), None),
+             ("东财 中债10Y", lambda ak: _bond_yield_em(ak, "中国国债收益率10年"), None)]
     if ts:
-        a50.append(("Tushare 富时A50现货指数(替代,存为A50_IDX)", lambda ak: tsrc.index_global_hist("XIN9"), "A50_IDX"))
+        a50.append(("Tushare 富时A50现货(A50_IDX)", lambda ak: tsrc.index_global_hist("XIN9"), "A50_IDX"))
         usd.insert(0, ("Tushare fx_daily", lambda ak: tsrc.fx_hist("USDCNH.FXCM"), None))
-        hsi.append(("Tushare index_global", lambda ak: tsrc.index_global_hist("HSI"), None))
+        hsi.insert(0, ("Tushare index_global", lambda ak: tsrc.index_global_hist("HSI"), None))
+        us10y.insert(0, ("Tushare us_tycr(y10)", lambda ak: tsrc.us_tycr_hist(), None))
+    else:
+        a50.append(("东财 国际期货", lambda ak: ak.futures_global_hist_em(symbol="富时中国A50指数当月连续"), None))
     return [
         ("A50", "富时中国A50期指", a50),
         ("USDCNH", "离岸人民币", usd),
-        ("HSAHP", "恒生AH股溢价指数", [("东财", lambda ak: ak.stock_hk_index_daily_em(symbol="HSAHP"), None)]),
+        ("HSAHP", "恒生AH股溢价指数", hsahp),
         ("HSI", "恒生指数", hsi),
-        ("FXI", "中国大盘ETF(美股)", [("新浪", lambda ak: ak.stock_us_daily(symbol="FXI"), None)]),
-        ("KWEB", "中概互联网ETF(美股)", [("新浪", lambda ak: ak.stock_us_daily(symbol="KWEB"), None)]),
+        ("FXI", "中国大盘ETF(美股)", [("新浪", lambda ak: _ak_fn(ak, "stock_us_hist_sina", "stock_us_daily")(symbol="FXI"), None)]),
+        ("KWEB", "中概互联网ETF(美股)", [("新浪", lambda ak: _ak_fn(ak, "stock_us_hist_sina", "stock_us_daily")(symbol="KWEB"), None)]),
+        ("US10Y", "10年期美债收益率(%)", us10y),
+        ("CN10Y", "10年期中债收益率(%)", cn10y),
     ]
 
 
@@ -777,6 +909,7 @@ def update_all(backfill_days=60, include_sector=True, include_cons=False, includ
         ("③ 四大指数日线", lambda p: download_prices("③", progress=p)),
         # 本地批量更新已覆盖板块个股和成分股，这里只下载 ETF
         ("④ ETF/板块个股日线", lambda p: download_prices("④", include_sector and not local, include_cons and not local, progress=p)),
+        ("板块复权因子", lambda p: update_sector_adj(p)),
         ("② 期指", lambda p: download_futures(backfill_days, p)),
         ("① 融资融券", lambda p: download_margin(backfill_days, p)),
         ("ETF份额", lambda p: incremental_update("etf_shares", backfill_days, p)),

@@ -387,3 +387,188 @@ def basket_avg_frame(sector_px: pd.DataFrame, codes, asof=None) -> pd.DataFrame:
     out["adj_avg"] = _chain_from_steps(g["raw_avg"], g["sum_close"] / g["sum_pre"].replace(0, np.nan))
     out["eq_avg"] = _chain_from_steps(g["raw_avg"], 1.0 + g["eq_ret"])
     return out
+# ───────────── 维度 1：跨境资金与宏观利率（相对强弱领先/验证模块）─────────────
+def _align_proxy_series(proxy_df: pd.DataFrame, symbol: str, ashare_dates: pd.DatetimeIndex, shift_us: bool) -> pd.Series:
+    """将外资代理或利率序列对齐到 A 股交易日（不向过去填充，避免未来函数）。
+    shift_us=True 用于美股/美债/NY17:00收盘外汇：将日期+1自然日后前向填充，确保 T 日只使用 T 日15:00前已知的隔夜收盘。"""
+    if proxy_df is None or proxy_df.empty:
+        return pd.Series(dtype=float, index=ashare_dates)
+    sub = proxy_df[proxy_df["symbol"] == symbol].copy()
+    if sub.empty:
+        return pd.Series(dtype=float, index=ashare_dates)
+    sub["date"] = pd.to_datetime(sub["date"], errors="coerce")
+    sub["close"] = pd.to_numeric(sub["close"], errors="coerce")
+    sub = sub.dropna(subset=["date", "close"])
+    sub = sub[sub["close"] > 0].sort_values("date").drop_duplicates("date", keep="last")
+    if sub.empty:
+        return pd.Series(dtype=float, index=ashare_dates)
+    idx = pd.DatetimeIndex(sub["date"])
+    if shift_us:
+        idx = idx + pd.Timedelta(days=1)
+    s = pd.Series(sub["close"].to_numpy(float), index=idx)
+    s = s[~s.index.duplicated(keep="last")].sort_index()
+    return s.reindex(s.index.union(ashare_dates)).sort_index().ffill().reindex(ashare_dates)
+
+
+def cross_border_analysis(proxy_df: pd.DataFrame, bench_close: pd.Series, def_curve: pd.Series, asof=None) -> dict:
+    """计算跨境资金与利率 5 指标信号、投票结论、拥挤度分位及「防御/沪深300」相对强弱序列。"""
+    b = bench_close.dropna().sort_index()
+    if asof is not None:
+        b = b[b.index <= pd.Timestamp(asof)]
+    if b.empty or proxy_df is None or proxy_df.empty:
+        return {}
+    ashare_dates = b.index
+
+    # A50 优先取交易时段与A股一致的 A50_IDX(XIN9)，否则取 A50(CHA50CFD)
+    s_a50_idx = _align_proxy_series(proxy_df, "A50_IDX", ashare_dates, shift_us=False)
+    s_a50_cfd = _align_proxy_series(proxy_df, "A50", ashare_dates, shift_us=False)
+    if s_a50_idx.notna().sum() >= 60 and (s_a50_cfd.isna().all() or s_a50_idx.dropna().index.max() >= s_a50_cfd.dropna().index.max()):
+        s_a50, a50_src = s_a50_idx, "A50_IDX(BJT)"
+    else:
+        s_a50, a50_src = s_a50_cfd, "A50(CHA50CFD)"
+
+    s_kweb = _align_proxy_series(proxy_df, "KWEB", ashare_dates, shift_us=True)
+    s_hsahp = _align_proxy_series(proxy_df, "HSAHP", ashare_dates, shift_us=False)
+    s_us10y = _align_proxy_series(proxy_df, "US10Y", ashare_dates, shift_us=True)
+    s_cn10y = _align_proxy_series(proxy_df, "CN10Y", ashare_dates, shift_us=False)
+
+    s_usdcnh = _align_proxy_series(proxy_df, "USDCNH", ashare_dates, shift_us=True)
+    if s_usdcnh.notna().sum() >= 20:
+        s_fx, fx_src = s_usdcnh, "USDCNH(NY+1日)"
+    else:
+        s_fx, fx_src = _align_proxy_series(proxy_df, "USDCNY_MID", ashare_dates, shift_us=False), "USDCNY_MID(BJT)"
+
+    s_kweb_a50 = (s_kweb / s_a50).where((s_kweb > 0) & (s_a50 > 0))
+    specs = [
+        ("kweb_a50", f"离岸成长风险偏好 (KWEB/{a50_src})", s_kweb_a50, -1, False, "美股收盘+1日 vs BJT"),
+        ("hsahp", "AH溢价情绪 (HSAHP)", s_hsahp, +1, False, "港股日频(同日)"),
+        ("us10y", "10Y美债收益率 (%)", s_us10y, +1, True, "美债收盘+1日"),
+        ("fx", f"汇率锚 ({fx_src})", s_fx, +1, False, "离岸NY+1日 / 中间价同日"),
+        ("cn10y", "10Y中债收益率 (%)", s_cn10y, -1, True, "中债日频(同日)"),
+    ]
+
+    votes = pd.DataFrame(index=ashare_dates)
+    impulses = pd.DataFrame(index=ashare_dates)
+    series_df = pd.DataFrame(index=ashare_dates)
+    meta = []
+
+    for key, label, s, def_sign, is_rate, tz_note in specs:
+        series_df[key] = s
+        ma5 = s.rolling(5, min_periods=5).mean()
+        ma20 = s.rolling(20, min_periods=20).mean()
+        if is_rate:
+            slope20 = ma20 - ma20.shift(5)
+            chg5 = ma5 - ma5.shift(5)
+            eps20, eps5 = 0.02, 0.01
+        else:
+            slope20 = ma20 / ma20.shift(5) - 1.0
+            chg5 = ma5 / ma5.shift(5) - 1.0
+            eps20, eps5 = 0.002, 0.002
+
+        v = pd.Series(np.nan, index=ashare_dates, dtype=float)
+        valid = slope20.notna() & ma5.notna() & ma20.notna()
+        v[valid] = 0.0
+        v[valid & (def_sign * slope20 > eps20) & (def_sign * (ma5 - ma20) > 0)] = 1.0
+        v[valid & (def_sign * slope20 < -eps20) & (def_sign * (ma5 - ma20) < 0)] = -1.0
+        votes[key] = v
+
+        imp = pd.Series(np.nan, index=ashare_dates, dtype=float)
+        iv = chg5.notna()
+        imp[iv] = 0.0
+        imp[iv & (def_sign * chg5 > eps5)] = 1.0
+        imp[iv & (def_sign * chg5 < -eps5)] = -1.0
+        impulses[key] = imp
+
+        meta.append({
+            "key": key, "指标": label, "def_sign": def_sign, "is_rate": is_rate, "时区对齐": tz_note,
+            "最新值": float(s.iloc[-1]) if s.notna().any() else np.nan,
+            "MA5": float(ma5.iloc[-1]) if ma5.notna().any() else np.nan,
+            "MA20": float(ma20.iloc[-1]) if ma20.notna().any() else np.nan,
+            "MA20近5日变化": float(slope20.iloc[-1]) if slope20.notna().any() else np.nan,
+            "短期5日动向": imp.iloc[-1],
+            "趋势投票": v.iloc[-1],
+        })
+
+    n_avail = votes.notna().sum(axis=1)
+    n_cont = (votes == 1.0).sum(axis=1)
+    n_conv = (votes == -1.0).sum(axis=1)
+    quorum = np.maximum(2, np.ceil(0.6 * n_avail)).astype(int)
+
+    verdict = pd.Series("中性观望", index=ashare_dates)
+    verdict[n_avail < 3] = "数据不足"
+    verdict[(n_avail >= 3) & (n_cont >= quorum) & (n_cont > n_conv)] = "背离延续"
+    verdict[(n_avail >= 3) & (n_conv >= quorum) & (n_conv > n_cont)] = "背离收敛"
+
+    net_score = (n_cont - n_conv) / n_avail.replace(0, np.nan)
+    imp_score = impulses.mean(axis=1)
+
+    # 防御综合 / 沪深300 相对强弱及 120 日拥挤度分位
+    dc = def_curve.dropna().sort_index() if def_curve is not None else pd.Series(dtype=float)
+    if asof is not None and len(dc):
+        dc = dc[dc.index <= pd.Timestamp(asof)]
+    common = b.index.intersection(dc.index)
+    rel_ratio = pd.Series(np.nan, index=ashare_dates, dtype=float)
+    rel_pct120 = pd.Series(np.nan, index=ashare_dates, dtype=float)
+    if len(common) >= 2:
+        raw_rel = (dc.loc[common] / dc.loc[common].iloc[0]) / (b.loc[common] / b.loc[common].iloc[0])
+        rel_ratio.loc[common] = raw_rel
+        rel_pct120.loc[common] = raw_rel.rolling(120, min_periods=40).rank(pct=True)
+
+    # 连续背离收敛天数
+    is_conv = (verdict == "背离收敛").astype(int)
+    conv_streak = is_conv.groupby((is_conv != is_conv.shift(1)).cumsum()).cumsum() * is_conv
+
+    panel = pd.DataFrame({
+        "n_avail": n_avail, "n_cont": n_cont, "n_conv": n_conv,
+        "net_score": net_score, "net_score_ma5": net_score.rolling(5, min_periods=1).mean(),
+        "imp_score": imp_score, "verdict": verdict, "conv_streak": conv_streak,
+        "rel_ratio": rel_ratio, "rel_pct120": rel_pct120,
+        "spread_cn_us": s_cn10y - s_us10y,
+    }, index=ashare_dates)
+
+    return {
+        "panel": panel, "series": series_df, "votes": votes,
+        "meta": pd.DataFrame(meta), "bench": b, "def_curve": dc,
+    }
+
+
+def cross_border_validation(cb_res: dict, horizons=(5, 10)) -> pd.DataFrame:
+    """用历史数据检验「背离延续 / 中性观望 / 背离收敛」之后相对强弱(防御综合-沪深300)的真实超额表现，并给出全样本基线对照。"""
+    if not cb_res:
+        return pd.DataFrame()
+    panel, b, dc = cb_res["panel"], cb_res["bench"], cb_res["def_curve"]
+    common = panel.index.intersection(b.index).intersection(dc.index)
+    if len(common) < 30:
+        return pd.DataFrame()
+    v = panel.loc[common, "verdict"]
+    d_sub = dc.loc[common]
+    b_sub = b.loc[common]
+
+    data = pd.DataFrame({"verdict": v}, index=common)
+    for h in horizons:
+        data[f"ex_{h}"] = (d_sub.shift(-h) / d_sub - 1.0) - (b_sub.shift(-h) / b_sub - 1.0)
+
+    valid_all = data[data["verdict"] != "数据不足"].dropna(subset=[f"ex_{horizons[0]}"])
+    if valid_all.empty:
+        return pd.DataFrame()
+
+    rows = []
+    tot_n = len(valid_all)
+    for lab in ("背离延续", "中性观望", "背离收敛", "全样本基准"):
+        g = valid_all if lab == "全样本基准" else valid_all[valid_all["verdict"] == lab]
+        if g.empty:
+            continue
+        row = {"信号": lab, "样本数": len(g), "占比": len(g) / tot_n}
+        for h in horizons:
+            ex = g[f"ex_{h}"].dropna()
+            row[f"后{h}日相对超额均值"] = ex.mean() if len(ex) else np.nan
+        ex5 = g[f"ex_{horizons[0]}"].dropna()
+        row[f"后{horizons[0]}日防御跑赢占比"] = (ex5 > 0).mean() if len(ex5) else np.nan
+        if lab == "背离延续":
+            row[f"按方向命中率({horizons[0]}日)"] = (ex5 > 0).mean() if len(ex5) else np.nan
+        elif lab == "背离收敛":
+            row[f"按方向命中率({horizons[0]}日)"] = (ex5 < 0).mean() if len(ex5) else np.nan
+        else:
+            row[f"按方向命中率({horizons[0]}日)"] = np.nan
+        rows.append(row)
+    return pd.DataFrame(rows)

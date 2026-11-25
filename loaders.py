@@ -99,9 +99,13 @@ def _looks_like_index_file(p: Path) -> bool:
     return False
 
 
-def _candidates(code: str) -> list:
+def _candidates(code: str, kind=None) -> list:
     paths = _file_index().get(code, [])
-    return [p for p in paths if _looks_like_index_file(p)] if _is_index_code(code) else paths
+    if kind == "index" or (kind is None and _is_index_code(code)):
+        return [p for p in paths if _looks_like_index_file(p)]
+    if kind == "stock":
+        return [p for p in paths if not _looks_like_index_file(p)]
+    return paths
 
 
 def rescan():
@@ -112,10 +116,108 @@ def has_local(code: str) -> bool:
     return bool(_candidates(code))
 
 
-def load_price(code: str):
-    """本地日线优先；若下载缓存里有更新的日期，只补本地最后一天之后的行。
-    读不出来/缺收盘列的文件会被跳过（原因见 diagnose），自动回退到下一个同代码文件。"""
-    paths = _candidates(code)
+def _adj_cache_path(code: str) -> Path:
+    d = config.CACHE_DIR / "adj_factor"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{code}.csv"
+
+
+def read_adj_factor(code: str):
+    """只读本地缓存的复权因子 CSV（不联网）。返回按日期升序排列的 Series 或 None。"""
+    p = _adj_cache_path(code)
+    if not p.exists():
+        return None
+    try:
+        df = pd.read_csv(p, dtype={"trade_date": str})
+        if df.empty:
+            return None
+        s = pd.Series(
+            pd.to_numeric(df["adj_factor"], errors="coerce").to_numpy(float),
+            index=pd.to_datetime(df["trade_date"].astype(str), errors="coerce"),
+        ).dropna().sort_index()
+        return s[~s.index.duplicated(keep="last")]
+    except Exception:  # noqa
+        return None
+
+
+def save_adj_factor(code: str, df_new: pd.DataFrame):
+    """增量合并保存单只标的的复权因子到 CACHE_DIR/adj_factor/{code}.csv。"""
+    if df_new is None or df_new.empty:
+        return
+    p = _adj_cache_path(code)
+    sub = df_new[["trade_date", "adj_factor"]].copy()
+    sub["trade_date"] = pd.to_datetime(sub["trade_date"].astype(str), errors="coerce").dt.strftime("%Y%m%d")
+    sub["adj_factor"] = pd.to_numeric(sub["adj_factor"], errors="coerce")
+    sub = sub.dropna(subset=["trade_date", "adj_factor"])
+    if sub.empty:
+        return
+    if p.exists():
+        try:
+            old = pd.read_csv(p, dtype={"trade_date": str})
+            sub = pd.concat([old[["trade_date", "adj_factor"]], sub], ignore_index=True)
+        except Exception:  # noqa
+            pass
+    sub = sub.drop_duplicates("trade_date", keep="last").sort_values("trade_date")
+    sub.to_csv(p, index=False)
+
+
+def get_adj_factor(code: str, first_dt=None, last_dt=None, kind=None, fetch_missing="if_missing"):
+    """获取个股/ETF 复权因子 Series。
+    fetch_missing: True=缺/落后就联网拉取；"if_missing"=仅本地完全没有缓存时才尝试联网一次；False=仅读本地缓存。"""
+    import os
+    import tushare_src as ts_src
+
+    s = read_adj_factor(code)
+    need = False
+    if fetch_missing is True:
+        if s is None or s.empty:
+            need = True
+        elif first_dt is not None and s.index.min() > pd.Timestamp(first_dt) + pd.Timedelta(days=45):
+            need = True
+        elif last_dt is not None and s.index.max() < pd.Timestamp(last_dt):
+            need = True
+    elif fetch_missing == "if_missing":
+        need = (s is None or s.empty)
+
+    if need and (not config.DEMO) and ts_src.available() and not os.environ.get("PYTEST_CURRENT_TEST"):
+        is_etf = (kind == "etf") or (kind is None and str(code).startswith(("51", "56", "58", "15", "16")))
+        api = "fund_adj" if is_etf else "adj_factor"
+        tscode = ts_src.ts_code(code, "etf" if is_etf else "stock")
+        st_ = pd.Timestamp(first_dt).strftime("%Y%m%d") if first_dt is not None else "20000101"
+        ed_ = pd.Timestamp(last_dt).strftime("%Y%m%d") if last_dt is not None else pd.Timestamp.today().strftime("%Y%m%d")
+        if s is not None and not s.empty and first_dt is not None and s.index.min() <= pd.Timestamp(first_dt) + pd.Timedelta(days=45):
+            st_ = (s.index.max() + pd.Timedelta(days=1)).strftime("%Y%m%d")
+        if st_ <= ed_:
+            try:
+                df_af = ts_src._windowed(api, st_, ed_, ts_code=tscode, fields="ts_code,trade_date,adj_factor")
+                if df_af is not None and len(df_af):
+                    save_adj_factor(code, df_af)
+                    s = read_adj_factor(code)
+            except Exception:  # noqa
+                pass
+    return s
+
+
+def apply_qfq(df: pd.DataFrame, af: pd.Series) -> pd.DataFrame:
+    """用复权因子对 OHLC 做前复权（以 df 最新交易日因子为基准=1）。volume / amount 不变。"""
+    if df is None or df.empty or af is None or af.empty:
+        return df
+    aligned = af.reindex(af.index.union(df.index)).sort_index().ffill().bfill().reindex(df.index)
+    last_af = float(aligned.iloc[-1])
+    if not (last_af > 0 and np.isfinite(last_af)):
+        return df
+    ratio = aligned / last_af
+    out = df.copy()
+    for c in ("open", "high", "low", "close"):
+        if c in out.columns:
+            out[c] = out[c] * ratio
+    return out
+
+
+def load_price(code: str, adjust=None, kind=None, fetch_adj="if_missing"):
+    """本地日线优先；若下载缓存里有更早或更新的日期，自动补齐两端（重叠日期仍以本地为准）。
+    adjust="qfq" 时自动对 OHLC 做前复权（指数无复权因子会自动跳过）。"""
+    paths = _candidates(code, kind=kind)
     if not paths:
         return None
     frames = []
@@ -136,12 +238,24 @@ def load_price(code: str):
     frames.sort(key=lambda d: "close" not in d.columns)    # 有收盘价的排前面（稳定排序，本地仍在前）
     base = frames[0]
     for extra in frames[1:]:
-        new = extra[extra.index > base.index.max()]
-        if len(new):
-            base = pd.concat([base, new[[c for c in new.columns if c in base.columns]]])
+        cols = [c for c in extra.columns if c in base.columns]
+        parts = [base]
+        early = extra[extra.index < base.index.min()]
+        if len(early):
+            parts.insert(0, early[cols])
+        late = extra[extra.index > base.index.max()]
+        if len(late):
+            parts.append(late[cols])
+        if len(parts) > 1:
+            base = pd.concat(parts).sort_index()
+            base = base[~base.index.duplicated(keep="last")]
     for c in ("open", "high", "low", "close", "volume"):
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
+    if adjust == "qfq" and not (kind == "index" or (kind is None and _is_index_code(code))):
+        af = get_adj_factor(code, base.index.min(), base.index.max(), kind=kind, fetch_missing=fetch_adj)
+        if af is not None and len(af):
+            base = apply_qfq(base, af)
     return base
 
 
@@ -179,11 +293,11 @@ def diagnose(codes) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def load_panel(codes, col="close", tail=None) -> pd.DataFrame:
+def load_panel(codes, col="close", tail=None, adjust=None) -> pd.DataFrame:
     """返回 日期 x 代码 的宽表；本地没有的代码直接缺列。"""
     series = {}
     for c in codes:
-        df = load_price(c)
+        df = load_price(c, adjust=adjust)
         if df is not None and col in df.columns:
             s = df[col]
             series[c] = s.tail(tail) if tail else s
