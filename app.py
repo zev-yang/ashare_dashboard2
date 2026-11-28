@@ -13,6 +13,7 @@ pg = st.navigation([
     st.Page("views/dashboard.py", title="指数分析", icon="📈", default=True),
     st.Page("views/avg_price.py", title="平均股价对比", icon="⚖️"),
     st.Page("views/value_screen.py", title="价值质量选股", icon="💎"),
+    st.Page("views/us_value_screen.py", title="美股价值选股", icon="🇺🇸"),
     st.Page("views/data.py", title="数据", icon="🗄️"),
 ])
 

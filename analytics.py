@@ -572,3 +572,367 @@ def cross_border_validation(cb_res: dict, horizons=(5, 10)) -> pd.DataFrame:
             row[f"按方向命中率({horizons[0]}日)"] = np.nan
         rows.append(row)
     return pd.DataFrame(rows)
+# ───────────── 总览：六因子整合信号与回测检验 ─────────────
+def etf_group_norm_series(flow: pd.DataFrame, aum: pd.DataFrame, codes, asof=None) -> pd.DataFrame:
+    """ETF 组日度序列：d1(当日净申购亿), d5(5日累计净申购亿), norm_d5(5日净申购/5日前规模)。"""
+    if flow is None or aum is None or flow.empty or aum.empty:
+        return pd.DataFrame()
+    cols = [c for c in codes if c in flow.columns]
+    if not cols:
+        return pd.DataFrame()
+    f = flow[cols].sum(axis=1, min_count=1).dropna().sort_index()
+    a = aum[cols].sum(axis=1, min_count=1).sort_index()
+    if asof is not None:
+        ts = pd.Timestamp(asof)
+        f, a = f[f.index <= ts], a[a.index <= ts]
+    if f.empty:
+        return pd.DataFrame()
+    a_al = a.reindex(a.index.union(f.index)).sort_index().ffill().reindex(f.index)
+    d5 = f.rolling(5, min_periods=5).sum()
+    base = a_al.shift(5)
+    norm_d5 = d5 / base.where(base > 0)
+    return pd.DataFrame({"d1": f, "d5": d5, "norm_d5": norm_d5}, index=f.index)
+
+
+def etf_factor_series(etf_df: pd.DataFrame) -> pd.DataFrame:
+    """② ETF 资金信号：温和流入(+1) / 温和流出(-1) / 死区或极端护盘事件(0)。"""
+    if etf_df is None or etf_df.empty:
+        return pd.DataFrame()
+    n5 = etf_df["norm_d5"]
+    sig = pd.Series(np.nan, index=etf_df.index, dtype=float)
+    valid = n5.notna()
+    sig[valid] = 0.0
+    sig[valid & (n5 >= 0.003) & (n5 < 0.03)] = 1.0
+    sig[valid & (n5 <= -0.003) & (n5 > -0.03)] = -1.0
+    extreme = valid & (n5.abs() >= 0.03)
+    return pd.DataFrame({"sig": sig, "norm_d5": n5, "d5": etf_df["d5"], "extreme": extreme}, index=etf_df.index)
+
+
+def ma_score_series(close: pd.Series, asof=None) -> pd.Series:
+    """⑤ 均线信号向量化序列：与 ma_status() 完全等价（多头+1 / 空头-1 / 震荡0）。"""
+    s = close.dropna().sort_index()
+    if asof is not None:
+        s = s[s.index <= pd.Timestamp(asof)]
+    if s.empty:
+        return pd.Series(dtype=float, index=pd.DatetimeIndex([]))
+    f = ma_frame(s)
+    c, m5, m20, m60 = f["close"], f["ma5"], f["ma20"], f["ma60"]
+    sc = pd.Series(np.nan, index=f.index, dtype=float)
+    valid = m60.notna()
+    sc[valid] = 0.0
+    sc[valid & (c > m20) & (m20 > m60) & (m5 > m20)] = 1.0
+    sc[valid & (c < m20) & (m20 < m60) & (m5 < m20)] = -1.0
+    return sc
+
+
+def aligned_hedge_frame(rank_tot: pd.DataFrame, index_close: pd.Series, mult: int,
+                        etf_flow: pd.Series, margin_dbal: pd.Series, cfg: dict, asof=None):
+    """修复收盘后 T+1 错位：若期货持仓已到 T 日而 ETF/融资只到 T-1，将 hedge_frame 截齐至共同最新日，
+    避免 5 日空单增量除以 4 日现货增量导致的偏投机偏差。返回 (hf, spot_lag)。"""
+    ts = pd.Timestamp(asof) if asof is not None else None
+    rt = rank_tot[rank_tot.index <= ts] if (ts is not None and len(rank_tot)) else rank_tot
+    ic = index_close[index_close.index <= ts] if (ts is not None and len(index_close)) else index_close
+    ef = etf_flow[etf_flow.index <= ts] if (ts is not None and etf_flow is not None and len(etf_flow)) else etf_flow
+    md = margin_dbal[margin_dbal.index <= ts] if (ts is not None and margin_dbal is not None and len(margin_dbal)) else margin_dbal
+
+    if rt is None or rt.empty:
+        return pd.DataFrame(), False
+
+    spot_maxes = []
+    for s in (ef, md):
+        if s is not None:
+            s2 = s.dropna()
+            if len(s2):
+                spot_maxes.append(s2.index.max())
+    spot_lag = False
+    if spot_maxes:
+        common_spot_max = min(spot_maxes)
+        if rt.index.max() > common_spot_max:
+            spot_lag = True
+            rt = rt[rt.index <= common_spot_max]
+    if rt.empty:
+        return pd.DataFrame(), spot_lag
+    return hedge_frame(rt, ic, mult, ef, md, cfg), spot_lag
+
+
+def futures_factor_series(hf: pd.DataFrame, basis: pd.DataFrame, fdaily_var: pd.DataFrame,
+                          idx_close: pd.Series, asof=None) -> pd.Series:
+    """③ 期指综合日度信号：空单性质(偏对冲+1/偏投机-1) + 5日年化基差变化(±1.5%) + 5日价仓动向，取合力符号。"""
+    s_px = idx_close.dropna().sort_index()
+    if asof is not None:
+        s_px = s_px[s_px.index <= pd.Timestamp(asof)]
+    if s_px.empty:
+        return pd.Series(dtype=float, index=pd.DatetimeIndex([]))
+    idx = s_px.index
+    subs = []
+
+    if hf is not None and not hf.empty:
+        sh = pd.Series(np.nan, index=hf.index, dtype=float)
+        labs = hf["label"].astype(str)
+        sh[labs != "数据不足"] = 0.0
+        sh[labs.str.startswith("偏对冲")] = 1.0
+        sh[labs.str.startswith("偏投机")] = -1.0
+        subs.append(sh.reindex(idx).ffill(limit=1))
+
+    if basis is not None and not basis.empty and "ann" in basis.columns:
+        b = basis.sort_index()
+        if asof is not None:
+            b = b[b.index <= pd.Timestamp(asof)]
+        ann = b["ann"].where(~b["scale_bad"].astype(bool)) if "scale_bad" in b.columns else b["ann"]
+        dann = ann - ann.shift(5)
+        sb = pd.Series(np.nan, index=b.index, dtype=float)
+        vb = dann.notna()
+        sb[vb] = 0.0
+        sb[vb & (dann > 0.015)] = 1.0
+        sb[vb & (dann < -0.015)] = -1.0
+        subs.append(sb.reindex(idx))
+
+    if fdaily_var is not None and not fdaily_var.empty:
+        fd = fdaily_var.copy()
+        fd["date"] = pd.to_datetime(fd["date"])
+        if asof is not None:
+            fd = fd[fd["date"] <= pd.Timestamp(asof)]
+        oi_tot = fd.groupby("date")["oi"].sum().sort_index().reindex(idx)
+        doi5 = oi_tot - oi_tot.shift(5)
+        ret5 = s_px / s_px.shift(5) - 1.0
+        so = pd.Series(np.nan, index=idx, dtype=float)
+        vo = doi5.notna() & ret5.notna()
+        so[vo] = 0.0
+        so[vo & (ret5 > 0.005) & (doi5 > 0)] = 1.0
+        so[vo & (ret5 < -0.005) & (doi5 > 0)] = -1.0
+        subs.append(so)
+
+    if not subs:
+        return pd.Series(dtype=float, index=idx)
+    mat = pd.concat(subs, axis=1)
+    n_sub = mat.notna().sum(axis=1)
+    tot = mat.sum(axis=1, min_count=1)
+    out = pd.Series(np.nan, index=idx, dtype=float)
+    ok = n_sub > 0
+    out[ok] = np.sign(tot[ok])
+    return out
+
+
+def margin_factor_series(mg_df: pd.DataFrame, asof=None) -> pd.DataFrame:
+    """④ 融资融券信号：融资买入占比5日 vs 20日(±0.2%死区) + 5日余额变化；>=40日有效分位时85%+触发过热封顶。"""
+    if mg_df is None or mg_df.empty:
+        return pd.DataFrame()
+    g = mg_df.sort_index()
+    if asof is not None:
+        g = g[g.index <= pd.Timestamp(asof)]
+    if g.empty:
+        return pd.DataFrame()
+    r = g["ratio"]
+    r5 = r.rolling(5, min_periods=3).mean()
+    r20 = r.rolling(20, min_periods=10).mean()
+    db5 = g["dbal"].rolling(5, min_periods=3).sum()
+    pct120 = r.rolling(120, min_periods=40).rank(pct=True)
+
+    raw_sig = pd.Series(np.nan, index=g.index, dtype=float)
+    valid = r5.notna() & r20.notna() & db5.notna()
+    raw_sig[valid] = 0.0
+    raw_sig[valid & (r5 > r20 + 0.002) & (db5 > 0)] = 1.0
+    raw_sig[valid & (r5 < r20 - 0.002) & (db5 < 0)] = -1.0
+
+    overheated = pct120 >= 0.85
+    ice_cold = pct120 <= 0.15
+    sig = raw_sig.where(~(overheated & (raw_sig > 0)), 0.0)
+    n_valid_r = r.notna().cumsum()
+    return pd.DataFrame({
+        "sig": sig, "raw_sig": raw_sig, "overheated": overheated,
+        "ice_cold": ice_cold, "pct120": pct120, "n_days": n_valid_r,
+    }, index=g.index)
+
+
+def sector_style_series(sec_close: pd.DataFrame, def_codes, bench_close: pd.Series, asof=None) -> pd.DataFrame:
+    """① 避险板块风格信号（站在宽基指数偏多视角：防御跑赢=-1，防御跑输=+1）。"""
+    b = bench_close.dropna().sort_index()
+    if asof is not None:
+        b = b[b.index <= pd.Timestamp(asof)]
+    if b.empty or sec_close is None or sec_close.empty:
+        return pd.DataFrame()
+    sc = sec_close[sec_close.index <= b.index[-1]]
+    cols = [c for c in def_codes if c in sc.columns]
+    if not cols:
+        return pd.DataFrame()
+    dc = basket_curve(sc[cols].dropna(how="all"), cols)
+    common = b.index.intersection(dc.index)
+    if len(common) < 25:
+        return pd.DataFrame()
+    b_c, d_c = b.loc[common], dc.loc[common]
+    ex5 = (d_c / d_c.shift(5) - 1.0) - (b_c / b_c.shift(5) - 1.0)
+    ex20 = (d_c / d_c.shift(20) - 1.0) - (b_c / b_c.shift(20) - 1.0)
+    rel = (d_c / d_c.iloc[0]) / (b_c / b_c.iloc[0])
+    pct120 = rel.rolling(120, min_periods=40).rank(pct=True)
+
+    sig = pd.Series(np.nan, index=common, dtype=float)
+    valid = ex5.notna() & ex20.notna()
+    sig[valid] = 0.0
+    sig[valid & (ex5 > 0.008) & (ex20 > 0)] = -1.0
+    sig[valid & (ex5 < -0.008) & (ex20 < 0)] = 1.0
+    return pd.DataFrame({
+        "sig": sig, "ex5": ex5, "ex20": ex20, "rel": rel,
+        "pct120": pct120, "crowded": pct120 >= 0.85,
+    }, index=common)
+
+
+def classify_overview_verdict(avg_score: float, n_active: int, f5_ma: float,
+                              warn_bull: bool = False, warn_bear: bool = False) -> str:
+    if n_active < 3 or avg_score != avg_score:
+        return "数据不足"
+    if avg_score >= 0.45:
+        return "🟠 谨慎偏多" if (warn_bull or (f5_ma == f5_ma and f5_ma < 0)) else "🔴 偏多共振"
+    if avg_score >= 0.15:
+        return "🟠 偏强观察"
+    if avg_score <= -0.45:
+        return "🟡 谨慎偏空" if (warn_bear or (f5_ma == f5_ma and f5_ma > 0)) else "🟢 偏空共振"
+    if avg_score <= -0.15:
+        return "🟡 偏弱观察"
+    return "⚪ 震荡分化"
+
+
+def overview_index_history(idx_close: pd.Series, sec_df: pd.DataFrame, etf_df: pd.DataFrame,
+                           fut_sig: pd.Series, mar_df: pd.DataFrame, cb_res: dict,
+                           is_sse50: bool = False, asof=None, lag_t1: bool = False) -> pd.DataFrame:
+    """构建单个指数的 6 因子历史面板（lag_t1=True 用于严格历史回测，将 T+1 早晨披露的 ETF/融资滞后1日）。"""
+    px = idx_close.dropna().sort_index()
+    if asof is not None:
+        px = px[px.index <= pd.Timestamp(asof)]
+    if px.empty:
+        return pd.DataFrame()
+    idx = px.index
+
+    f5 = ma_score_series(px)
+    f3 = fut_sig.reindex(idx) if (fut_sig is not None and len(fut_sig)) else pd.Series(np.nan, index=idx)
+
+    if etf_df is not None and not etf_df.empty:
+        if lag_t1:
+            f2 = etf_df["sig"].reindex(idx).shift(1)
+            ext2 = etf_df["extreme"].reindex(idx).shift(1).eq(True)
+        else:
+            f2 = etf_df["sig"].reindex(idx).ffill(limit=1)
+            ext2 = etf_df["extreme"].reindex(idx).ffill(limit=1).eq(True)
+    else:
+        f2, ext2 = pd.Series(np.nan, index=idx), pd.Series(False, index=idx)
+
+    if mar_df is not None and not mar_df.empty:
+        if lag_t1:
+            f4 = mar_df["sig"].reindex(idx).shift(1)
+            ovh4 = mar_df["overheated"].reindex(idx).shift(1).eq(True)
+        else:
+            f4 = mar_df["sig"].reindex(idx).ffill(limit=1)
+            ovh4 = mar_df["overheated"].reindex(idx).ffill(limit=1).eq(True)
+    else:
+        f4, ovh4 = pd.Series(np.nan, index=idx), pd.Series(False, index=idx)
+
+    if is_sse50:
+        f1 = pd.Series(np.nan, index=idx)
+        f6 = pd.Series(np.nan, index=idx)
+        crd1 = pd.Series(False, index=idx)
+        crd6 = pd.Series(False, index=idx)
+    else:
+        if sec_df is not None and not sec_df.empty:
+            f1 = sec_df["sig"].reindex(idx)
+            crd1 = sec_df["crowded"].reindex(idx).fillna(False)
+        else:
+            f1, crd1 = pd.Series(np.nan, index=idx), pd.Series(False, index=idx)
+        if cb_res and "panel" in cb_res and not cb_res["panel"].empty:
+            cp = cb_res["panel"]
+            vmap = {"背离收敛": 1.0, "中性观望": 0.0, "背离延续": -1.0}
+            f6 = cp["verdict"].map(vmap).reindex(idx)
+            crd6 = (cp["rel_pct120"] >= 0.85).reindex(idx).fillna(False)
+        else:
+            f6, crd6 = pd.Series(np.nan, index=idx), pd.Series(False, index=idx)
+
+    mat = pd.DataFrame({
+        "f1": f1, "f2": f2, "f3": f3, "f4": f4, "f5": f5, "f6": f6,
+    }, index=idx)
+    core_mat = mat[["f2", "f3", "f4", "f5"]]
+    n_active = mat.notna().sum(axis=1)
+    score_sum = mat.sum(axis=1, min_count=1)
+    avg_score = score_sum / n_active.where(n_active >= 3)
+    core_score = core_mat.sum(axis=1, min_count=1) / core_mat.notna().sum(axis=1).where(core_mat.notna().sum(axis=1) >= 2)
+
+    warn_bull = ext2 | ovh4
+    warn_bear = crd1 | crd6
+    verdicts = [
+        classify_overview_verdict(a, int(n), m5, bool(wb), bool(wbr))
+        for a, n, m5, wb, wbr in zip(avg_score, n_active, f5, warn_bull, warn_bear)
+    ]
+    mat["n_active"] = n_active
+    mat["core_score"] = core_score
+    mat["avg_score"] = avg_score
+    mat["verdict"] = verdicts
+    mat["warn_bull"] = warn_bull
+    mat["warn_bear"] = warn_bear
+    return mat
+
+
+def overview_backtest(idx_close: pd.Series, ov_bt_df: pd.DataFrame, horizons=(5, 10)):
+    """分别检验：① 综合评级(+1偏多/-1偏空/0震荡) vs 全样本基线；② 6个单因子各自的历史预测表现。"""
+    px = idx_close.dropna().sort_index()
+    if ov_bt_df is None or ov_bt_df.empty or len(px) < 30:
+        return pd.DataFrame(), pd.DataFrame()
+    common = px.index.intersection(ov_bt_df.index)
+    if len(common) < 30:
+        return pd.DataFrame(), pd.DataFrame()
+
+    p = px.loc[common]
+    df = ov_bt_df.loc[common].copy()
+    for h in horizons:
+        df[f"fwd_{h}"] = p.shift(-h) / p - 1.0
+
+    # 1) 综合评级分组
+    v = df["verdict"].astype(str)
+    bucket = pd.Series("震荡分化", index=df.index)
+    bucket[v.str.contains("偏多|偏强")] = "偏多信号"
+    bucket[v.str.contains("偏空|偏弱")] = "偏空信号"
+    bucket[v == "数据不足"] = "数据不足"
+    df["bucket"] = bucket
+    valid_comp = df[df["bucket"] != "数据不足"].dropna(subset=[f"fwd_{horizons[0]}"])
+
+    comp_rows = []
+    if len(valid_comp):
+        tot_n = len(valid_comp)
+        for lab in ("偏多信号", "震荡分化", "偏空信号", "全样本基准"):
+            g = valid_comp if lab == "全样本基准" else valid_comp[valid_comp["bucket"] == lab]
+            if g.empty:
+                continue
+            r5 = g[f"fwd_{horizons[0]}"].dropna()
+            r10 = g[f"fwd_{horizons[1]}"].dropna()
+            hit = np.nan
+            if lab == "偏多信号" and len(r5):
+                hit = (r5 > 0).mean()
+            elif lab == "偏空信号" and len(r5):
+                hit = (r5 < 0).mean()
+            comp_rows.append({
+                "综合分类": lab, "样本日": len(g), "占比": len(g) / tot_n,
+                f"后{horizons[0]}日均涨跌": r5.mean() if len(r5) else np.nan,
+                f"后{horizons[1]}日均涨跌": r10.mean() if len(r10) else np.nan,
+                f"后{horizons[0]}日上涨占比": (r5 > 0).mean() if len(r5) else np.nan,
+                f"方向命中率({horizons[0]}日)": hit,
+            })
+
+    # 2) 单因子各自表现（每个因子独立取自身全部有效样本日）
+    fac_names = [
+        ("f1", "① 避险板块"), ("f2", "② ETF资金"), ("f3", "③ 期指持仓"),
+        ("f4", "④ 融资融券"), ("f5", "⑤ 均线"), ("f6", "⑥ 跨境资金"),
+    ]
+    fac_rows = []
+    h0 = horizons[0]
+    for fk, flab in fac_names:
+        sub = df[[fk, f"fwd_{h0}"]].dropna()
+        if sub.empty:
+            continue
+        pos = sub[sub[fk] > 0][f"fwd_{h0}"]
+        neg = sub[sub[fk] < 0][f"fwd_{h0}"]
+        dir_sub = sub[sub[fk] != 0]
+        hit = ((dir_sub[fk] > 0) == (dir_sub[f"fwd_{h0}"] > 0)).mean() if len(dir_sub) else np.nan
+        fac_rows.append({
+            "因子": flab, "有效样本日": len(sub), "触发率(|1|)": (sub[fk] != 0).mean(),
+            f"+1后{h0}日均涨跌": pos.mean() if len(pos) else np.nan,
+            f"-1后{h0}日均涨跌": neg.mean() if len(neg) else np.nan,
+            "多空差(+1减-1)": (pos.mean() - neg.mean()) if (len(pos) and len(neg)) else np.nan,
+            f"方向命中率({h0}日)": hit,
+        })
+    return pd.DataFrame(comp_rows), pd.DataFrame(fac_rows)

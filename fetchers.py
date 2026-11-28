@@ -459,16 +459,25 @@ def update_range(name: str, start, end, progress=None, refresh_last: int = 0) ->
     return log
 
 
+def _target_backfill_start(end, backfill_days: int):
+    cal = trading_days(end - pd.Timedelta(days=int(backfill_days * 1.7) + 25), end)
+    return cal[-backfill_days] if len(cal) > backfill_days else cal[0]
+
+
 def incremental_update(name: str, backfill_days: int = 60, progress=None) -> list:
-    """增量：已有数据 → 从最后一天往前 10 个交易日起补（顺便补洞）；没有 → 回补最近 backfill_days 个交易日。"""
+    """增量：若已有数据起点覆盖不够 backfill_days 个交易日，自动向前补齐缺口；已够则仅从最后10天增量补洞。"""
     end = pd.Timestamp.today().normalize()
     df = read_ds(name)
+    target_start = _target_backfill_start(end, backfill_days)
     if name == "etf_shares" and "tushare" in _sources():          # 按代码取整段历史，十几次调用
-        start0 = (df["date"].max() - pd.Timedelta(days=15)) if len(df) else end - pd.Timedelta(days=int(backfill_days * 1.6) + 10)
+        if len(df) and df["date"].min() <= target_start + pd.Timedelta(days=7):
+            start0 = df["date"].max() - pd.Timedelta(days=15)
+        else:
+            start0 = target_start
         try:
             codes = sorted({c for v in config.ETF_GROUPS.values() for c in v})
             n = append_ds("etf_shares", tsrc.etf_shares_history(codes, start0))
-            return [f"etf_shares: Tushare 按代码取 {len(codes)} 只 ETF，写入 {n} 行"]
+            return [f"etf_shares: Tushare 按代码取 {len(codes)} 只 ETF（自 {pd.Timestamp(start0).date()}），写入 {n} 行"]
         except Exception as e:  # noqa
             if _sources() == ["tushare"]:
                 return [f"etf_shares: Tushare 失败 {explain(e)}"]
@@ -478,12 +487,12 @@ def incremental_update(name: str, backfill_days: int = 60, progress=None) -> lis
 
 
 def _incremental_by_day(name, df, end, backfill_days, progress):
-    if len(df):
+    target_start = _target_backfill_start(end, backfill_days)
+    if len(df) and df["date"].min() <= target_start + pd.Timedelta(days=7):
         cal = trading_days(df["date"].max() - pd.Timedelta(days=30), end)
         start = cal[-11] if len(cal) > 10 else cal[0]
     else:
-        cal = trading_days(end - pd.Timedelta(days=int(backfill_days * 1.6) + 10), end)
-        start = cal[-backfill_days] if len(cal) > backfill_days else cal[0]
+        start = target_start
     return update_range(name, start, end, progress, refresh_last=REFRESH_LAST)
 
 
