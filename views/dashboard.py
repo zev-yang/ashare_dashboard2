@@ -107,68 +107,167 @@ for nm, info in IDX.items():
     fut[nm] = dict(tot=tot, etf_f=etf_f, dbal=dbal, cls=cls,
                    basis=an.basis_series(fdaily, cls, v) if len(fdaily) else pd.DataFrame())
 
+# 跨境资金与避险相对强弱（供总览与 ⑥ 跨境资金 共用）
+proxy_df = ds("proxy_daily", S)
+def_all_df = sec_close[sec_close.index <= asof][[c for c in def_codes if c in sec_close.columns]].dropna(how="all") if len(sec_close) else pd.DataFrame()
+def_curve_all = an.basket_curve(def_all_df, def_codes) if len(def_all_df) else pd.Series(dtype=float)
+cb_res = an.cross_border_analysis(proxy_df, bench_close, def_curve_all, asof) if len(proxy_df) else {}
+sec_style_df = an.sector_style_series(sec_close, def_codes, bench_close, asof) if len(sec_close) else pd.DataFrame()
+
+# 六因子总览集成（实盘快照 + 严格 T+1 滞后回测）
+ov_live, ov_bt, ov_meta = {}, {}, {}
+for nm, info in IDX.items():
+    cls = idx_close[info["code"]]
+    etf_s_df = an.etf_group_norm_series(flow, aum, config.ETF_GROUPS[nm], asof) if flow is not None else pd.DataFrame()
+    etf_f_df = an.etf_factor_series(etf_s_df)
+    mar_f_df = an.margin_factor_series(mg[nm], asof) if nm in mg else pd.DataFrame()
+    f_info = fut.get(nm)
+    spot_lag = False
+    if f_info:
+        hf_al, spot_lag = an.aligned_hedge_frame(f_info["tot"], f_info["cls"], info["mult"], f_info["etf_f"], f_info["dbal"], config.HEDGE, asof)
+        fd_var = fdaily[fdaily["variety"] == info["fut"]] if len(fdaily) else pd.DataFrame()
+        fut_s = an.futures_factor_series(hf_al, f_info["basis"], fd_var, cls, asof)
+    else:
+        hf_al, fut_s = pd.DataFrame(), pd.Series(dtype=float)
+
+    is50 = (info["code"] == "000016") or (nm == "上证50")
+    ov_live[nm] = an.overview_index_history(cls, sec_style_df, etf_f_df, fut_s, mar_f_df, cb_res, is_sse50=is50, asof=asof, lag_t1=False)
+    ov_bt[nm] = an.overview_index_history(cls, sec_style_df, etf_f_df, fut_s, mar_f_df, cb_res, is_sse50=is50, asof=asof, lag_t1=True)
+    ov_meta[nm] = {
+        "hf": hf_al, "spot_lag": spot_lag, "etf_f": etf_f_df, "mar_f": mar_f_df,
+        "basis": f_info["basis"] if f_info else pd.DataFrame(), "is50": is50,
+    }
+
 tabs = st.tabs(["总览", "① 避险板块", "② ETF资金", "③ 期指持仓", "④ 融资融券", "⑤ 均线", "⑥ 跨境资金", "说明与限制"])
 
 # ═════════ 总览 ═════════
 with tabs[0]:
-    rows = []
+    # ── Layer A: 市场风格与流动性政体卡片 ──
+    c_reg1, c_reg2 = st.columns(2)
+    with c_reg1:
+        sec_s_last = sec_style_df.iloc[-1] if len(sec_style_df) else None
+        cb_last = cb_res["panel"].iloc[-1] if (cb_res and len(cb_res.get("panel", []))) else None
+        s1_txt = "偏防御" if (sec_s_last is not None and sec_s_last["sig"] < 0) else ("偏宽基" if (sec_s_last is not None and sec_s_last["sig"] > 0) else "中性")
+        s6_txt = str(cb_last["verdict"]) if cb_last is not None else "无数据"
+        if s1_txt == "偏防御" and s6_txt == "背离延续":
+            reg_title, reg_delta = "避险防御共振", "①防御占优 + ⑥跨境偏防御"
+        elif s1_txt == "偏宽基" and s6_txt == "背离收敛":
+            reg_title, reg_delta = "宽基风险偏好共振", "①防御跑输 + ⑥跨境偏宽基"
+        else:
+            reg_title, reg_delta = "风格震荡 / 分化", f"①在岸{s1_txt} ｜ ⑥跨境{s6_txt}"
+        crd_p = sec_s_last["pct120"] if sec_s_last is not None else np.nan
+        if pd.notna(crd_p) and crd_p >= 0.85:
+            reg_delta += f" ｜ ⚠️防御拥挤{crd_p:.0%}"
+        c_reg1.metric("市场风格政体（①避险 + ⑥跨境）", reg_title, reg_delta)
+    with c_reg2:
+        tot_etf5 = sum(v["d5"] for v in etf_res.values() if v and pd.notna(v.get("d5"))) if etf_res else np.nan
+        mar_300 = mg_sum.get(config.BENCH, {})
+        m_txt = f"沪深300融资分位 {pct(mar_300.get('pct'), 0)}" if "pct" in mar_300 else "融资暂无分位"
+        e_txt = f"四大宽基ETF 5日净申购 {num(tot_etf5)} 亿" if tot_etf5 == tot_etf5 else "ETF份额无数据"
+        c_reg2.metric("在岸资金与杠杆（②ETF + ④融资）", e_txt, m_txt)
+
+    # ── Layer B: 6 因子信号矩阵（含综合评级）──
+    def _badge(v, is50=False, is_style=False, note=""):
+        if is50 and is_style:
+            return "⚪ 0(重合)"
+        if v is None or v != v:
+            return "—"
+        if v > 0:
+            return f"🔴 +1{note}"
+        if v < 0:
+            return f"🟢 -1{note}"
+        return f"⚪ 0{note}"
+
+    sig_rows, detail_rows = [], []
     for nm, info in IDX.items():
         r = an.period_returns(idx_close[info["code"]], asof)
-        e, m, f = etf_res.get(nm), mg_sum.get(nm, {}), fut.get(nm)
-        label, ann, d_short = "—", np.nan, np.nan
-        if f:
-            hf = an.hedge_frame(f["tot"], f["cls"], info["mult"], f["etf_f"], f["dbal"], config.HEDGE)
-            label, d_short = hf["label"].iloc[-1], hf["short_add"].iloc[-1]
-            if len(f["basis"]):
-                ann = f["basis"]["ann"].dropna().iloc[-1] if f["basis"]["ann"].notna().any() else np.nan
-        sig = [("均线", ma[nm]["score"]), ("ETF5日", np.sign(e["d5"]) if e else 0),
-               ("避险相对强弱(当周)", -np.sign(def_rel["wtd"]) if def_rel["wtd"] == def_rel["wtd"] else 0),
-               ("期指空单", 1 if label.startswith("偏对冲") else (-1 if label.startswith("偏投机") else 0))]
-        rows.append({"指数": nm, "当日": r["day"], "本周": r["wtd"], "本月": r["mtd"], "均线": ma[nm]["state"],
-                     "ETF近5日净申购(亿)": e["d5"] if e else np.nan, "融资买入占比": m.get("ratio", np.nan),
-                     "融资占比分位": m.get("pct", np.nan), "前20空单5日增量(亿)": d_short, "年化基差": ann,
-                     "空单性质": label, "偏多信号": sum(1 for _, v in sig if v > 0), "偏空信号": sum(1 for _, v in sig if v < 0)})
-    show(pd.DataFrame(rows), pct_cols=["当日", "本周", "本月", "融资买入占比", "融资占比分位", "年化基差"],
-         num_cols=["ETF近5日净申购(亿)", "前20空单5日增量(亿)"], color_cols=["当日", "本周", "本月", "ETF近5日净申购(亿)"])
-    # ── 数据时效 / 缺失原因：哪些列用的是旧数据、为什么是"—" ──
+        ov_df = ov_live.get(nm, pd.DataFrame())
+        om = ov_meta.get(nm, {})
+        is50 = om.get("is50", False)
+
+        if len(ov_df):
+            last_ov = ov_df.iloc[-1]
+            notes = []
+            ef_df = om.get("etf_f", pd.DataFrame())
+            mf_df = om.get("mar_f", pd.DataFrame())
+            e_note = "护盘" if (len(ef_df) and bool(ef_df["extreme"].iloc[-1])) else ""
+            m_note = ""
+            if len(mf_df):
+                if bool(mf_df["overheated"].iloc[-1]):
+                    m_note = "(过热)"
+                    notes.append("融资≥85%过热")
+                elif bool(mf_df["ice_cold"].iloc[-1]):
+                    m_note = "(冰点)"
+                    notes.append("融资≤15%冰点")
+            if e_note:
+                notes.append("ETF极端大额")
+            if bool(last_ov["warn_bear"]):
+                notes.append("防御≥85%高拥挤")
+            if om.get("spot_lag"):
+                notes.append("期指对冲用T-1现货")
+
+            sig_rows.append({
+                "指数": nm, "当日": r["day"], "本周": r["wtd"], "本月": r["mtd"],
+                "①避险": _badge(last_ov["f1"], is50, True),
+                "②ETF": _badge(last_ov["f2"], note=f"({e_note})" if e_note else ""),
+                "③期指": _badge(last_ov["f3"]),
+                "④融资": _badge(last_ov["f4"], note=m_note),
+                "⑤均线": _badge(last_ov["f5"]),
+                "⑥跨境": _badge(last_ov["f6"], is50, True),
+                "自身趋势(②~⑤)": last_ov["core_score"],
+                "综合得分": last_ov["avg_score"],
+                "有效因子": f"{int(last_ov['n_active'])}/{4 if is50 else 6}",
+                "综合信号": str(last_ov["verdict"]),
+                "风险/状态提示": "；".join(notes) if notes else "正常",
+            })
+
+        e, m = etf_res.get(nm), mg_sum.get(nm, {})
+        hf_al = om.get("hf", pd.DataFrame())
+        label, d_short, ann = "—", np.nan, np.nan
+        if len(hf_al):
+            label, d_short = hf_al["label"].iloc[-1], hf_al["short_add"].iloc[-1]
+        bs_df = om.get("basis", pd.DataFrame())
+        if len(bs_df) and bs_df["ann"].notna().any():
+            bs_sub = bs_df[bs_df.index <= asof]["ann"].dropna()
+            if len(bs_sub):
+                ann = bs_sub.iloc[-1]
+        detail_rows.append({
+            "指数": nm, "均线状态": ma[nm]["state"],
+            "ETF5日(亿)": e["d5"] if e else np.nan,
+            "ETF5日/规模": e["norm_d5"] if e else np.nan,
+            "融资买入占比": m.get("ratio", np.nan),
+            "融资120日分位": m.get("pct", np.nan),
+            "空单5日增量(亿)": d_short, "年化基差": ann, "空单性质": label,
+        })
+
+    if sig_rows:
+        show(
+            pd.DataFrame(sig_rows),
+            pct_cols=["当日", "本周", "本月"],
+            num_cols=["自身趋势(②~⑤)", "综合得分"],
+            color_cols=["当日", "本周", "本月", "自身趋势(②~⑤)", "综合得分"],
+        )
+    st.caption("🔴 +1 = 偏多 ｜ ⚪ 0 = 中性/死区/事件观察 ｜ 🟢 -1 = 偏空。上证50 因重仓银行/石油/电力与防御板块高度重合，①避险与⑥跨境记为 0(重合) 且分母按 4 因子计，其余宽基按 6 因子计。")
+
+    with st.expander("展开各指数底层数值明细（ETF规模比、融资分位、期指基差与空单性质）", expanded=False):
+        show(
+            pd.DataFrame(detail_rows),
+            pct_cols=["ETF5日/规模", "融资买入占比", "融资120日分位", "年化基差"],
+            num_cols=["ETF5日(亿)", "空单5日增量(亿)"],
+            color_cols=["ETF5日(亿)", "ETF5日/规模"],
+        )
+
+    # ── 数据时效 / 缺失与异常诊断（保留原有一致性检查）──
     _asof = pd.Timestamp(asof)
     _stale = []
-    for _lab, _df_, _cols in (("融资融券", margin, "融资买入占比、融资占比分位"), ("ETF份额", shares, "ETF近5日净申购"),
-                              ("期指持仓排名", rank, "前20空单5日增量、空单性质"), ("期指日行情", fdaily, "年化基差")):
+    for _lab, _df_, _cols in (("融资融券", margin, "④融资"), ("ETF份额", shares, "②ETF"),
+                              ("期指持仓排名", rank, "③期指"), ("期指日行情", fdaily, "③年化基差")):
         if len(_df_) and pd.Timestamp(_df_["date"].max()) < _asof:
             _stale.append(f"**{_lab}** 只到 {pd.Timestamp(_df_['date'].max()).date()}（统计截止日 {_asof.date()}）→ 影响列：{_cols}")
     if _stale:
-        st.warning("⏳ 以下数据**不是最新**，对应列用的是更早的数据（融资融券 / ETF份额通常次日早晨才披露，之后的更新会补上）：\n\n- "
+        st.warning("⏳ 以下数据**不是最新**，相关因子使用最近可用日数据（融资/ETF份额通常次日早晨披露）：\n\n- "
                    + "\n- ".join(_stale))
-    _why = []
-    for _nm, _info in IDX.items():
-        _m = mg_sum.get(_nm) or {}
-        if "ratio" in _m:
-            continue
-        if not len(margin):
-            _why.append("融资融券明细是空的（「数据」页点 ①）")
-            break
-        if not len(cons):
-            _why.append("没有指数成分股名单（「数据」页点「指数成分股名单」）")
-            break
-        _cc = cons.loc[cons["index_code"] == _info["code"], "code"].tolist()
-        if not _cc:
-            _why.append(f"{_nm}：没有成分股名单（「数据」页点「指数成分股名单」）")
-            continue
-        if not margin["code"].isin(_cc).any():
-            _why.append(f"{_nm}：融资融券明细里一只成分股都没匹配上（股票代码格式不一致？）")
-            continue
-        _amt = amount_panel(tuple(_cc), S)
-        _na = _amt.shape[1] if len(_amt) else 0
-        if _na == 0:
-            _why.append(f"{_nm}：成分股 {len(_cc)} 只，本地一只都没有带成交额的日线，算不出占比（「数据」页点 ⑥ 补日线）")
-        else:
-            _why.append(f"{_nm}：成分股 {len(_cc)} 只里本地有成交额的 {_na} 只，但和融资数据没有重叠的交易日"
-                        f"（成交额到 {pd.Timestamp(_amt.index.max()).date()}，融资到 {pd.Timestamp(margin['date'].max()).date()}）")
-    if _why:
-        st.info("融资买入占比 / 分位显示为「—」的原因：\n\n- " + "\n- ".join(_why))
-    st.markdown(f"**避险防御篮子相对沪深300**：当日 {pct(def_rel['day'])} ｜ 本周 {pct(def_rel['wtd'])} ｜ 本月 {pct(def_rel['mtd'])}"
-                f"（防御篮子 = 角色为\"防御\"的板块成分股等权；正值表示防御跑赢大盘）")
+
     problems = []
     for nm, info in IDX.items():
         sr = idx_close[info["code"]].dropna()
@@ -184,25 +283,29 @@ with tabs[0]:
                             "（年化基差已不显示；先用「数据」页的健康检查/诊断确认指数文件是否被同号个股覆盖）")
     for p_ in problems:
         st.error(p_)
-    why = []
-    if not len(shares):
-        why.append("**ETF份额**数据集为空 → ETF净申购无法计算（到「数据」页点 ④，或看各步骤日志里 ETF份额 那一行的失败原因）")
-    elif all(v is None for v in etf_res.values()):
-        have = sorted(set(shares["code"]))
-        need = sorted({c for v in config.ETF_GROUPS.values() for c in v})
-        miss_px = [c for c in need if c not in etf_close.columns]
-        why.append(f"ETF份额有 {len(have)} 只，但算不出净申购：本地缺 ETF 日线 {miss_px or '无'}；"
-                   f"份额里不含的配置代码 {[c for c in need if c not in have] or '无'}（净申购=份额变化×收盘价，两者都要有）")
-    if not len(rank):
-        why.append("**期指持仓排名**数据集为空 → 空单增量/空单性质无法计算（到「数据」页点 ②）")
-    elif not fut:
-        why.append("期指持仓排名有数据，但截止日之前没有记录（检查「统计截止日」或数据日期）")
-    if not len(fdaily):
-        why.append("**期指日行情**数据集为空 → 年化基差无法计算（到「数据」页点 ②）")
-    for w in why:
-        st.warning(w)
-    st.caption("信号计数规则：均线多头排列=+1/空头排列=−1；ETF近5日净申购>0=+1/<0=−1；防御本周跑赢沪深300=−1，跑输=+1；"
-               "空单性质偏对冲=+1/偏投机=−1。**该计数只是规则汇总，尚未经过回测验证，不能当作交易信号。**")
+
+    st.markdown(f"**避险防御篮子相对沪深300**：当日 {pct(def_rel['day'])} ｜ 本周 {pct(def_rel['wtd'])} ｜ 本月 {pct(def_rel['mtd'])}"
+                f"（防御篮子 = 角色为\"防御\"的板块成分股前复权等权；正值表示防御跑赢大盘）")
+
+    # ── Layer C: 6 因子与综合信号历史回测检验 ──
+    with st.expander("历史回测检验：综合信号与 6 个单因子在各指数上是否真有预测区分度？", expanded=False):
+        bt_idx = st.radio("选择检验指数", list(IDX.keys()), horizontal=True, key="ov_bt_idx")
+        bt_df = ov_bt.get(bt_idx, pd.DataFrame())
+        comp_bt, fac_bt = an.overview_backtest(idx_close[IDX[bt_idx]["code"]], bt_df, horizons=(5, 10))
+        if len(comp_bt):
+            n_samp = int(comp_bt.loc[comp_bt["综合分类"] == "全样本基准", "样本日"].iloc[0]) if (comp_bt["综合分类"] == "全样本基准").any() else 0
+            if n_samp < 120:
+                st.warning(f"当前 6 因子重叠样本仅 **{n_samp}** 个交易日（通常因融资/ETF份额/期指默认只回补了 60 天），统计样本偏少；可到「数据」页加大「首次回补交易日数」后重拉。")
+            st.markdown("**① 综合信号分组表现（已对 T+1 早晨披露的 ETF/融资做滞后 1 日防未来对齐）**")
+            show(comp_bt, pct_cols=["占比", "后5日均涨跌", "后10日均涨跌", "后5日上涨占比", "方向命中率(5日)"],
+                 color_cols=["后5日均涨跌", "后10日均涨跌"])
+        else:
+            st.info(f"{bt_idx} 当前有效重叠交易日不足 30 天，尚无法运行综合回测。")
+        if len(fac_bt):
+            st.markdown("**② 6 个单因子各自独立表现（分别取各自全部可用历史）**")
+            show(fac_bt, pct_cols=["触发率(|1|)", "+1后5日均涨跌", "-1后5日均涨跌", "多空差(+1减-1)", "方向命中率(5日)"],
+                 color_cols=["+1后5日均涨跌", "-1后5日均涨跌", "多空差(+1减-1)"])
+            st.caption("判断标准：若「+1后5日均涨跌」显著高于「-1后5日均涨跌」（多空差显著为正），说明该因子在该指数上确实具备正向区分度；反之接近 0% 说明近乎随机噪声。")
 
 # ═════════ ① 避险板块 ═════════
 with tabs[1]:
@@ -437,9 +540,6 @@ with tabs[5]:
 # ═════════ ⑥ 跨境资金 ═════════
 with tabs[6]:
     st.subheader("维度 1：跨境资金与宏观利率（领先 / 共振风格判断）")
-    proxy_df = ds("proxy_daily", S)
-    def_all_df = sec_close[sec_close.index <= asof][[c for c in def_codes if c in sec_close.columns]].dropna(how="all") if len(sec_close) else pd.DataFrame()
-    def_curve_all = an.basket_curve(def_all_df, def_codes) if len(def_all_df) else pd.Series(dtype=float)
 
     have_syms = sorted(set(proxy_df["symbol"])) if len(proxy_df) else []
     need_rates = [s for s in ("US10Y", "CN10Y") if s not in have_syms]
@@ -451,8 +551,6 @@ with tabs[6]:
         )
         if u2.button("🔄 更新外资代理与利率 (⑤)", width="stretch", key="cb_upd_btn"):
             run_job("⑤ 外资代理与利率", lambda p: fetchers.download_proxies(p))
-
-    cb_res = an.cross_border_analysis(proxy_df, bench_close, def_curve_all, asof) if len(proxy_df) else {}
     if not cb_res:
         st.info("还没有外资代理与利率数据，请点击上方「🔄 更新外资代理与利率 (⑤)」。")
     else:
